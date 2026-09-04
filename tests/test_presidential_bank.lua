@@ -377,6 +377,16 @@ do
     if str == "token" then
       return { dictionary = function() return { rftoken = "RF-123" } end }
     end
+    if str == "absOk" then
+      return { dictionary = function()
+        return { resultURL = "https://www.presidentialpcbanking.com/dbank/live/app/postLogin" }
+      end }
+    end
+    if str == "absEvil" then
+      return { dictionary = function()
+        return { resultURL = "https://evil.example/phish" }
+      end }
+    end
     return { dictionary = function() return nil end }
   end
 
@@ -385,6 +395,16 @@ do
 
   local url2 = extractPostLoginUrl("nested")
   assertEq(url2, "https://www.presidentialpcbanking.com/dbank/live/app/postLogin", "extractPostLoginUrl.nested")
+
+  local urlAbs = extractPostLoginUrl("absOk")
+  assertEq(urlAbs, "https://www.presidentialpcbanking.com/dbank/live/app/postLogin", "extractPostLoginUrl.absOk")
+
+  local okEvil, errEvil = pcall(extractPostLoginUrl, "absEvil")
+  assertEq(okEvil, false, "extractPostLoginUrl.absEvil.throws")
+  assertEq(
+    type(errEvil) == "string" and errEvil:find("nicht erlaubt", 1, true) ~= nil,
+    true,
+    "extractPostLoginUrl.absEvil.message")
 
   assertEq(extractRftokenFromText('{"rftoken":"RF-123"}'), "RF-123", "extractRftokenFromText.json")
 end

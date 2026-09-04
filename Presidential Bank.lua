@@ -7,7 +7,7 @@
 --
 
 WebBanking{
-  version     = 1.01,
+  version     = 1.02,
   url         = "https://www.presidentialpcbanking.com",
   services    = {"Presidential Bank"},
   description = "Presidential Bank - MFA and Cookie Import"
@@ -17,7 +17,8 @@ local CONSTANTS = {
   baseUrl = "https://www.presidentialpcbanking.com",
   authApi = "https://www.presidentialpcbanking.com/auth-olb/live/v1",
   acctsApi = "https://www.presidentialpcbanking.com/accts-olb/live/v1",
-  bankCode = "255073345"
+  bankCode = "255073345",
+  allowedHost = "www.presidentialpcbanking.com",
 }
 
 local CREDENTIAL_REJECTION_MARKERS = {
@@ -1071,6 +1072,13 @@ function extractPostLoginUrl(mfaResponse)
   end
 
   if resultUrl:match("^https?://") then
+    local host = resultUrl:match("^https?://([^/]+)")
+    if host then
+      host = host:lower():gsub(":443$", ""):gsub(":80$", "")
+    end
+    if host ~= CONSTANTS.allowedHost then
+      error("Presidential Bank: resultURL Host nicht erlaubt: " .. tostring(host))
+    end
     return resultUrl
   end
   if resultUrl:match("^/app/") then
