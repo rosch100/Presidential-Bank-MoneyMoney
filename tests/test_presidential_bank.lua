@@ -253,26 +253,8 @@ do
   assertEq(extractCsrfTokenFromCookies("nope=1"), nil, "extractCsrfTokenFromCookies.none=nil")
 end
 
--- buildApiHeaders / mergeSessionCookie / buildLoginUpdateBody / applyResponseCookies
+-- buildApiHeaders / mergeSessionCookie / applyResponseCookies
 do
-  function JSON()
-    return {
-      set = function(_, tbl)
-        return {
-          json = function()
-            if tbl.mfaInfo and tbl.mfaInfo.computerPrivate then
-              return '{"csrftoken":"' .. tbl.csrftoken .. '","mfaInfo":{"computerPrivate":true}}'
-            end
-            if tbl.csrftoken then
-              return '{"csrftoken":"' .. tbl.csrftoken .. '"}'
-            end
-            return "{}"
-          end
-        }
-      end
-    }
-  end
-
   mergeSessionCookie("SESSION_TOKEN", "AAA")
   mergeSessionCookie("CSRFToken", "XYZ")
   local h = buildApiHeaders()
@@ -287,8 +269,6 @@ do
   h = buildApiHeaders()
   assertEq(extractCookieValue(h["Cookie"], "rftoken"), "RF-NEW", "mergeSessionCookie.update")
 
-  assertEq(buildLoginUpdateBody(), '{"csrftoken":"XYZ"}', "buildLoginUpdateBody.fromCookieCsrf")
-
   mergeSessionCookie("MAF_IB_testdevice", "trust-token")
   assertEq(hasPrivateDeviceCookie(), true, "hasPrivateDeviceCookie.mafIb")
   assertEq(hasPrivateDeviceCookieInMap({ MAF_IB_abc = "x" }), true, "hasPrivateDeviceCookieInMap.mafIb")
@@ -299,13 +279,13 @@ do
   assertEq(extractCookieValue(h["Cookie"], "rftoken"), "FROM-HEADER", "applyResponseCookies.setCookieEntry")
 end
 
--- buildMfaSelectUrl / buildMfaSubmitUrl / mfaVirtualButtonLabel / buildMfaSelectBody / buildMfaSubmitBody / isMfaSelectSuccess
+-- buildMfaSelectUrl / buildMfaSubmitUrl / buildMfaSelectBody / buildMfaSubmitBody / isMfaSelectSuccess
 do
   local methods = {
-    { protocol = "SMS", type = "sms", id = "sms-1", label = "Text me" },
-    { protocol = "VOICE", type = "voice", id = "voice-1", label = "Call me" },
-    { protocol = "EMAIL", type = "email", id = "email-1", label = "Email me" },
-    { protocol = "TOTP", type = "totp", id = "totp-1", label = "Enter code" }
+    { protocol = "SMS", type = "sms", id = "sms-1" },
+    { protocol = "VOICE", type = "voice", id = "voice-1" },
+    { protocol = "EMAIL", type = "email", id = "email-1" },
+    { protocol = "TOTP", type = "totp", id = "totp-1" }
   }
 
   for _, method in ipairs(methods) do
@@ -325,7 +305,6 @@ do
       base .. "submit?displayMethod=" .. method.protocol .. "&type=OTP&cookieoptin=false",
       "buildMfaSubmitUrl.noCookieoptin." .. method.type
     )
-    assertEq(mfaVirtualButtonLabel(method), method.label, "mfaVirtualButtonLabel." .. method.type)
   end
 
   mergeSessionCookie("CSRFToken", "XYZ")
@@ -458,6 +437,27 @@ do
   assertEq(storage.presidentialRftoken, "RF-PERSIST", "persistSessionState.rftoken")
   assertEq(storage.presidentialCsrfToken, "PERSIST-XYZ", "persistSessionState.csrfToken")
   assertEq(storage.presidentialSession, nil, "persistSessionState.noLegacyNested")
+
+  assertEq(
+    getPersistedSessionSnapshot({
+      presidentialSession = {
+        sessionCookies = { SESSION_TOKEN = "LEGACY" },
+        loginComplete = true,
+        accountKey = "user1"
+      }
+    }),
+    nil,
+    "getPersistedSessionSnapshot.ignoresNestedLegacy")
+  assertEq(
+    canRestorePersistedSession({
+      presidentialSession = {
+        sessionCookies = { SESSION_TOKEN = "LEGACY" },
+        loginComplete = true,
+        accountKey = "user1"
+      }
+    }, "user1"),
+    false,
+    "canRestorePersistedSession.ignoresNestedLegacy")
 
   local storagePrivate = {
     connectionAccountKey = "user1",
@@ -707,6 +707,14 @@ assertEq(
   resolveAccountId({ accountNumber = "Checking *9999", name = "Shared" }),
   nil,
   "resolveAccountId.rejectsAmbiguousName")
+assertEq(
+  resolveAccountId({ accountNumber = "", name = "Shared" }),
+  nil,
+  "resolveAccountId.rejectsNameOnly")
+assertEq(
+  resolveAccountId({ name = "Shared" }),
+  nil,
+  "resolveAccountId.rejectsMissingAccountNumber")
 assertEq(
   resolveAccountId({_internalId = "0", accountNumber = "Checking *9999"}),
   nil,

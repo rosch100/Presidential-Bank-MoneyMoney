@@ -73,7 +73,6 @@ function InitializeSession2(protocol, bankCode, step, credentials, interactive)
   connection.useragent = "Mozilla/5.0 (Macintosh; Intel Mac OS X 10_15_7) AppleWebKit/605.1.15"
 
   if storage and accountKey ~= "" then
-    migratePresidentialSessionStorage(storage)
     restorePersistedSessionState(storage, accountKey)
   end
 
@@ -140,10 +139,6 @@ function handleLoginStep1(credentials)
 
   local storage = rawget(_G, "LocalStorage")
   local accountKey = username or ""
-
-  if storage then
-    migratePresidentialSessionStorage(storage)
-  end
 
   if storage then
     local jarResult = tryConnectionJarLogin(storage, accountKey)
@@ -380,19 +375,6 @@ function handleMethodSelection(userInput)
   end
 
   return mfaCodeChallenge(session.selectedMfaMethod)
-end
-
-function mfaVirtualButtonLabel(method)
-  local labels = {
-    totp = "Enter code",
-    sms = "Text me",
-    voice = "Call me",
-    email = "Email me"
-  }
-  if not method or not method.type then
-    return "MFA"
-  end
-  return labels[method.type] or method.protocol
 end
 
 function buildMfaSelectUrl(method)
@@ -697,42 +679,10 @@ function collectPresidentialSessionCookies()
   return map
 end
 
-function migratePresidentialSessionStorage(storage)
-  if type(storage.presidentialSessionCookies) == "table" then
-    return
-  end
-  local legacy = storage.presidentialSession
-  local cookieMap = {}
-  if type(legacy) == "table" then
-    if type(legacy.sessionCookies) == "table" then
-      cookieMap = legacy.sessionCookies
-    elseif type(legacy.cookies) == "string" and legacy.cookies ~= "" then
-      cookieMap = sessionCookiesFromHeader(legacy.cookies)
-    end
-    if legacy.accountKey then
-      storage.presidentialSessionAccountKey = legacy.accountKey
-    end
-    if legacy.rftoken then
-      storage.presidentialRftoken = legacy.rftoken
-    end
-    if legacy.csrfToken then
-      storage.presidentialCsrfToken = legacy.csrfToken
-    end
-    if legacy.deviceRegisteredPrivate == true then
-      storage.presidentialDevicePrivate = true
-    end
-    if legacy.loginComplete == true then
-      storage.presidentialLoginComplete = true
-    end
-  end
-  storage.presidentialSessionCookies = cookieMap
-end
-
 function getPersistedSessionSnapshot(storage)
   if not storage then
     return nil
   end
-  migratePresidentialSessionStorage(storage)
   if type(storage.presidentialSessionCookies) ~= "table" then
     return nil
   end
@@ -955,14 +905,6 @@ function withCookieHeader(headers)
   return headers
 end
 
-function buildLoginUpdateBody()
-  local csrf = session.csrfToken or extractCsrfTokenFromCookies(session.cookies) or ""
-  if csrf == "" then
-    return "{}"
-  end
-  return JSON():set({ csrftoken = csrf }):json()
-end
-
 function performLoginUpdate(referer)
   syncSessionCookies()
   local headers = withCookieHeader({
@@ -1002,28 +944,6 @@ function performApiRequest(method, url, body, contentType, referer)
   return response
 end
 
-function applyConfigCsrf(data)
-  if not data then
-    return
-  end
-  local csrf = extractCsrfToken(data)
-  if csrf then
-    session.csrfToken = csrf
-  end
-end
-
-function fetchPostLoginConfig(referer)
-  local configUrl = CONSTANTS.authApi .. "/login/postlogin/config"
-  local content = performApiRequest("GET", configUrl, nil, nil, referer)
-  local data = parseJson(content)
-  if data then
-    session.postLoginConfig = data
-    applyConfigCsrf(data)
-    return data
-  end
-  return nil
-end
-
 function collectRftokenFromResponses(...)
   for i = 1, select("#", ...) do
     local text = select(i, ...)
@@ -1042,11 +962,6 @@ function collectRftokenFromResponses(...)
   end
 
   return session.rftoken
-end
-
-function isApiErrorResponse(response)
-  local data = parseJson(response)
-  return data and data.errorCode ~= nil
 end
 
 function extractPostLoginUrl(mfaResponse)
@@ -1434,6 +1349,10 @@ function resolveAccountId(account)
     return account._internalId, account._balance
   end
 
+  if type(account.accountNumber) ~= "string" or account.accountNumber == "" then
+    return nil
+  end
+
   local discovered = ListAccounts({})
   if type(discovered) ~= "table" then
     return nil
@@ -1441,15 +1360,9 @@ function resolveAccountId(account)
 
   local matches = {}
   for _, acc in ipairs(discovered) do
-    local numberMatches = type(account.accountNumber) == "string"
-      and account.accountNumber ~= ""
-      and (acc.accountNumber == account.accountNumber
-        or acc._internalId == account.accountNumber)
-    local nameMatches = (account.accountNumber == nil or account.accountNumber == "")
-      and type(account.name) == "string"
-      and account.name ~= ""
-      and acc.name == account.name
-    if (numberMatches or nameMatches) and isValidAccountId(acc._internalId) then
+    local numberMatches = acc.accountNumber == account.accountNumber
+      or acc._internalId == account.accountNumber
+    if numberMatches and isValidAccountId(acc._internalId) then
       matches[#matches + 1] = acc
     end
   end
