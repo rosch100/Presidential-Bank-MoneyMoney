@@ -274,9 +274,200 @@ do
   assertEq(hasPrivateDeviceCookieInMap({ MAF_IB_abc = "x" }), true, "hasPrivateDeviceCookieInMap.mafIb")
   assertEq(hasPrivateDeviceCookie("SESSION_TOKEN=1"), false, "hasPrivateDeviceCookie.withoutMaf")
 
+  assertEq(isSessionScopedCookieName("SESSION_TOKEN"), true, "isSessionScopedCookieName.session")
+  assertEq(isSessionScopedCookieName("MAF_IB_testdevice"), false, "isSessionScopedCookieName.mafKept")
+  local staleStorage = {
+    connectionAccountKey = "user1",
+    connectionsByAccount = {
+      ["user1"] = {
+        sessionCookies = {
+          SESSION_TOKEN = "DEAD",
+          CSRFToken = "X",
+          MAF_IB_testdevice = "trust-token",
+        },
+        rftoken = "RF",
+        csrfToken = "X",
+        deviceRegisteredPrivate = true,
+        loginComplete = true,
+      },
+    },
+    presidentialSessionCookies = {
+      SESSION_TOKEN = "DEAD",
+      MAF_IB_testdevice = "trust-token",
+    },
+    presidentialDevicePrivate = true,
+    presidentialLoginComplete = true,
+  }
+  clearStaleSessionTokens(staleStorage, "user1")
+  assertEq(
+    staleStorage.connectionsByAccount["user1"].sessionCookies.MAF_IB_testdevice,
+    "trust-token",
+    "clearStaleSessionTokens.keepsMaf")
+  assertEq(
+    staleStorage.connectionsByAccount["user1"].sessionCookies.SESSION_TOKEN,
+    nil,
+    "clearStaleSessionTokens.dropsSessionToken")
+  assertEq(
+    staleStorage.connectionsByAccount["user1"].deviceRegisteredPrivate,
+    true,
+    "clearStaleSessionTokens.keepsPrivateFlag")
+  assertEq(
+    staleStorage.presidentialLoginComplete,
+    nil,
+    "clearStaleSessionTokens.clearsLoginComplete")
+
   applyResponseCookies({ { name = "Set-Cookie", value = "rftoken=FROM-HEADER; Path=/" } })
   h = buildApiHeaders()
   assertEq(extractCookieValue(h["Cookie"], "rftoken"), "FROM-HEADER", "applyResponseCookies.setCookieEntry")
+end
+
+-- loginRedirectRequiresMfa: only skip TOTP on clear success; MFA redirect stays MFA
+do
+  assertEq(
+    loginRedirectRequiresMfa({ targetView = "mfa" }, '{"targetView":"mfa"}'),
+    true,
+    "loginRedirectRequiresMfa.mfaView")
+  assertEq(
+    loginRedirectRequiresMfa(
+      { targetView = "redirect", targetData = "nxg-olb/mfa" },
+      '{"targetData":"nxg-olb/mfa","targetView":"redirect"}'),
+    true,
+    "loginRedirectRequiresMfa.redirectToMfa")
+  assertEq(
+    loginRedirectRequiresMfa({ targetView = "redirect" }, '{"targetView":"redirect"}'),
+    true,
+    "loginRedirectRequiresMfa.bareRedirectRequiresMfa")
+  assertEq(
+    loginRedirectRequiresMfa({ targetView = "success" }, '{"targetView":"success"}'),
+    false,
+    "loginRedirectRequiresMfa.successView")
+  assertEq(
+    loginRedirectRequiresMfa(
+      { targetView = "redirect", resultURL = "/dbank/live/app/postLogin" },
+      '{"targetView":"redirect","resultURL":"/dbank/live/app/postLogin"}'),
+    false,
+    "loginRedirectRequiresMfa.resultURL")
+  assertEq(
+    loginRedirectRequiresMfa(
+      { targetView = "redirect", resultURL = "/dbank/live/app/mfa" },
+      "{}"),
+    true,
+    "loginRedirectRequiresMfa.resultUrlMfa")
+  assertEq(
+    loginRedirectRequiresMfa({ mfaRequired = false }, "{}"),
+    false,
+    "loginRedirectRequiresMfa.mfaRequiredFalse")
+end
+
+-- mfaLSO / Private Device cookie wiring for post-restart MFA skip
+do
+  clearInMemorySessionCookies()
+  connection = Connection()
+  mergeSessionCookie("MAF_IB_zzz", "trust-value-99")
+  assertEq(getMfaLsoQueryValue(), "trust-value-99", "getMfaLsoQueryValue.fromMaf")
+  assertEq(
+    buildLoginRedirectUrl("trust-value-99"),
+    "https://www.presidentialpcbanking.com/auth-olb/live/v1/login/redirect?mfaLSO=trust-value-99",
+    "buildLoginRedirectUrl.withLso")
+  assertEq(
+    buildLoginRedirectUrl(""),
+    "https://www.presidentialpcbanking.com/auth-olb/live/v1/login/redirect?mfaLSO=",
+    "buildLoginRedirectUrl.emptyLso")
+
+  clearInMemorySessionCookies()
+  connection = Connection()
+  local storage = {
+    connectionAccountKey = "user1",
+    connectionsByAccount = {
+      ["user1"] = {
+        sessionCookies = { MAF_IB_zzz = "restored-token", SESSION_TOKEN = "dead" },
+        deviceRegisteredPrivate = true,
+      },
+    },
+  }
+  assertEq(ensurePrivateDeviceCookiesApplied(storage, "user1"), true, "ensurePrivateDeviceCookiesApplied.ok")
+  assertEq(hasPrivateDeviceCookie(), true, "ensurePrivateDeviceCookiesApplied.hasCookie")
+  assertEq(getMfaLsoQueryValue(), "restored-token", "ensurePrivateDeviceCookiesApplied.mfaLso")
+end
+
+-- EndSession / persist must never leave Connection userdata in LocalStorage
+do
+  clearInMemorySessionCookies()
+  connection = Connection()
+  mergeSessionCookie("MAF_IB_persist", "keep-me")
+  mergeSessionCookie("SESSION_TOKEN", "sess")
+  LocalStorage = { connectionAccountKey = "user1" }
+  persistSessionState(LocalStorage)
+  assertEq(
+    LocalStorage.connectionsByAccount["user1"].connection,
+    nil,
+    "persistSessionState.neverStoresConnection")
+  assertEq(LocalStorage.connection, nil, "persistSessionState.clearsTopConnection")
+  assertEq(
+    LocalStorage.connectionsByAccount["user1"].sessionCookies.MAF_IB_persist,
+    "keep-me",
+    "persistSessionState.keepsMafCookies")
+  assertEq(
+    LocalStorage.presidentialPrivateDeviceCookies.MAF_IB_persist,
+    "keep-me",
+    "persistSessionState.dedicatedPrivateSlot")
+  assertEq(
+    getPersistedSessionSnapshot(LocalStorage, "user1").sessionCookies.MAF_IB_persist,
+    "keep-me",
+    "persistSessionState.snapshotStillWorks")
+end
+
+-- Dedicated private-device slot restores mfaLSO after simulated MM restart
+do
+  clearInMemorySessionCookies()
+  connection = Connection()
+  local storage = {
+    connectionAccountKey = "user1",
+    presidentialPrivateDeviceCookies = { MAF_IB_zzz = "dedicated-token" },
+    presidentialPrivateDeviceAccountKey = "user1",
+  }
+  assertEq(ensurePrivateDeviceCookiesApplied(storage, "user1"), true, "dedicatedSlot.ensure")
+  assertEq(getMfaLsoQueryValue(), "dedicated-token", "dedicatedSlot.mfaLso")
+  assertEq(
+    diagnosePersistedPrivateDevice(storage, "user1"):match("dedicated=true") ~= nil,
+    true,
+    "dedicatedSlot.diagnose")
+
+  -- Account-Key-Mismatch darf Private-Device nicht blockieren (Log dedicated=true/privateCount=0)
+  clearInMemorySessionCookies()
+  connection = Connection()
+  local mismatched = {
+    presidentialPrivateDeviceCookies = { MAF_IB_zzz = "mismatch-token" },
+    presidentialPrivateDeviceAccountKey = "old-user",
+  }
+  assertEq(
+    ensurePrivateDeviceCookiesApplied(mismatched, "new-user"),
+    true,
+    "dedicatedSlot.keyMismatch.ensure")
+  assertEq(getMfaLsoQueryValue(), "mismatch-token", "dedicatedSlot.keyMismatch.mfaLso")
+
+  -- Shareview-Muster: flacher Cookie-Header-String
+  clearInMemorySessionCookies()
+  connection = Connection()
+  local withHeader = {
+    presidentialPrivateDeviceCookieHeader = "MAF_IB_hdr=header-token",
+  }
+  assertEq(
+    ensurePrivateDeviceCookiesApplied(withHeader, "any"),
+    true,
+    "dedicatedSlot.header.ensure")
+  assertEq(getMfaLsoQueryValue(), "header-token", "dedicatedSlot.header.mfaLso")
+
+  clearInMemorySessionCookies()
+  connection = Connection()
+  mergeSessionCookie("MAF_IB_persist2", "hdr-save")
+  local persistStore = { connectionAccountKey = "user1" }
+  persistSessionState(persistStore)
+  assertEq(
+    type(persistStore.presidentialPrivateDeviceCookieHeader) == "string"
+      and persistStore.presidentialPrivateDeviceCookieHeader:match("MAF_IB_persist2=hdr%-save") ~= nil,
+    true,
+    "persistSessionState.writesCookieHeader")
 end
 
 -- buildMfaSelectUrl / buildMfaSubmitUrl / buildMfaSelectBody / buildMfaSubmitBody / isMfaSelectSuccess
@@ -437,6 +628,60 @@ do
   assertEq(storage.presidentialRftoken, "RF-PERSIST", "persistSessionState.rftoken")
   assertEq(storage.presidentialCsrfToken, "PERSIST-XYZ", "persistSessionState.csrfToken")
   assertEq(storage.presidentialSession, nil, "persistSessionState.noLegacyNested")
+  assertEq(
+    type(storage.connectionsByAccount[""].sessionCookies),
+    "table",
+    "persistSessionState.mapEntry")
+
+  -- Multi-login: two accountKeys keep distinct session cookies in the map
+  do
+    local storageMulti = { connectionAccountKey = "user-a" }
+    mergeSessionCookie("SESSION_TOKEN", "AAA")
+    mergeSessionCookie("rftoken", "RF-A")
+    mergeSessionCookie("CSRFToken", "CSRF-A")
+    persistSessionState(storageMulti)
+    storageMulti.connectionAccountKey = "user-b"
+    mergeSessionCookie("SESSION_TOKEN", "BBB")
+    mergeSessionCookie("rftoken", "RF-B")
+    mergeSessionCookie("CSRFToken", "CSRF-B")
+    persistSessionState(storageMulti)
+    assertEq(
+      storageMulti.connectionsByAccount["user-a"].sessionCookies.SESSION_TOKEN,
+      "AAA",
+      "multiLogin.map.userA")
+    assertEq(
+      storageMulti.connectionsByAccount["user-b"].sessionCookies.SESSION_TOKEN,
+      "BBB",
+      "multiLogin.map.userB")
+    local snapA = getPersistedSessionSnapshot(storageMulti, "user-a")
+    assertEq(snapA.sessionCookies.SESSION_TOKEN, "AAA", "multiLogin.snapshot.userA")
+    local snapB = getPersistedSessionSnapshot(storageMulti, "user-b")
+    assertEq(snapB.sessionCookies.SESSION_TOKEN, "BBB", "multiLogin.snapshot.userB")
+
+    -- Empty map entry for user-c must not borrow user-b's top-level mirror.
+    storageMulti.connectionsByAccount["user-c"] = { connection = {} }
+    assertEq(
+      getPersistedSessionSnapshot(storageMulti, "user-c"),
+      nil,
+      "multiLogin.snapshot.emptyEntryNoLegacySteal")
+
+    -- Empty map entry for the same login must still restore via top-level mirror
+    -- (MoneyMoney restart often drops Connection while keeping cookie tables).
+    storageMulti.connectionsByAccount["user-a"] = { connection = nil }
+    storageMulti.presidentialSessionCookies = { SESSION_TOKEN = "AAA-MIRROR" }
+    storageMulti.presidentialSessionAccountKey = "user-a"
+    storageMulti.presidentialLoginComplete = true
+    local snapRestart = getPersistedSessionSnapshot(storageMulti, "user-a")
+    assertEq(snapRestart ~= nil, true, "multiLogin.snapshot.emptyEntrySameLoginLegacy")
+    assertEq(
+      snapRestart.sessionCookies.SESSION_TOKEN,
+      "AAA-MIRROR",
+      "multiLogin.snapshot.emptyEntrySameLoginLegacy.token")
+    assertEq(
+      canRestorePersistedSession(storageMulti, "user-a"),
+      true,
+      "multiLogin.canRestore.emptyEntrySameLoginLegacy")
+  end
 
   assertEq(
     getPersistedSessionSnapshot({

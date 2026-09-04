@@ -7,7 +7,7 @@
 --
 
 WebBanking{
-  version     = 1.01,
+  version     = 1.09,
   url         = "https://www.presidentialpcbanking.com",
   services    = {"Presidential Bank"},
   description = "Presidential Bank - MFA and Cookie Import"
@@ -53,27 +53,31 @@ end
 function InitializeSession2(protocol, bankCode, step, credentials, interactive)
   local storage = rawget(_G, "LocalStorage")
   local accountKey = credentials and credentials[1] or ""
-  local canReuse =
-    storage and storage.connection and storage.connectionAccountKey == accountKey
 
-  if canReuse then
-    connection = storage.connection
+  if storage then
+    -- Connection-Userdata niemals in LocalStorage legen: MoneyMoney serialisiert
+    -- sonst oft die Cookie-Tabellen beim Quit nicht (TOTP nach jedem Neustart).
+    stripNonSerializableConnections(storage)
+    local reuseOk = connection ~= nil
+      and session.persistedConnection
+      and accountKeysMatch(session.activeAccountKey, accountKey)
+    if not reuseOk then
+      connection = Connection()
+    end
     session.persistedConnection = true
+    session.activeAccountKey = accountKey
+    storage.connectionAccountKey = accountKey
+    getConnectionEntry(storage, accountKey)
   else
     connection = Connection()
-    if storage then
-      storage.connection = connection
-      storage.connectionAccountKey = accountKey
-      session.persistedConnection = true
-    else
-      session.persistedConnection = false
-    end
+    session.persistedConnection = false
   end
   connection.language = "en-US"
   connection.useragent = "Mozilla/5.0 (Macintosh; Intel Mac OS X 10_15_7) AppleWebKit/605.1.15"
 
   if storage and accountKey ~= "" then
     restorePersistedSessionState(storage, accountKey)
+    ensurePrivateDeviceCookiesApplied(storage, accountKey)
   end
 
   if step == 1 then
@@ -129,6 +133,220 @@ function classifyLoginRedirectError(loginData)
   return nil
 end
 
+function loginRedirectRequiresMfa(redirectData, redirectResponse)
+  if type(redirectData) ~= "table" then
+    return true
+  end
+
+  -- Log 2026-09-04: {"targetData":"nxg-olb/mfa","targetView":"redirect"} → MFA nötig.
+  -- Bare targetView "redirect" is NOT success; isMfaSuccess() would mis-classify it.
+  local targetData = redirectData.targetData
+  if type(targetData) == "string" then
+    local dataLower = targetData:lower()
+    if dataLower:find("mfa", 1, true) or dataLower:find("otp", 1, true) then
+      return true
+    end
+  elseif type(targetData) == "table" then
+    local nestedView = targetData.targetView or targetData.view
+    if type(nestedView) == "string" then
+      local nestedLower = nestedView:lower()
+      if nestedLower:find("mfa", 1, true) or nestedLower:find("otp", 1, true) then
+        return true
+      end
+    end
+  end
+
+  if redirectData.mfaRequired == false then
+    return false
+  end
+
+  local view = redirectData.targetView
+  if type(view) == "string" then
+    local lower = view:lower()
+    if lower == "mfa"
+        or lower == "otp"
+        or lower == "restore_mfa_redirect"
+        or lower:find("mfa", 1, true)
+        or lower:find("otp", 1, true) then
+      return true
+    end
+    if lower == "success"
+        or lower == "home"
+        or lower == "postlogin"
+        or lower == "accounts" then
+      return false
+    end
+  end
+
+  local resultUrl = redirectData.resultURL
+  if type(resultUrl) == "string" and resultUrl ~= "" then
+    local urlLower = resultUrl:lower()
+    if urlLower:find("mfa", 1, true) or urlLower:find("otp", 1, true) then
+      return true
+    end
+    return false
+  end
+
+  if extractPostLoginUrl(redirectResponse) then
+    return false
+  end
+
+  return true
+end
+
+function isPrivateDeviceCookieName(name)
+  if type(name) ~= "string" or name == "" then
+    return false
+  end
+  if name:match("^MAF_IB_") then
+    return true
+  end
+  local lower = name:lower()
+  return lower:match("^maf_ib_")
+      or lower == "mfalso"
+      or lower == "mfa_lso"
+      or lower == "di_mfa"
+end
+
+function getPrimaryPrivateDeviceCookie()
+  syncSessionCookies()
+  local map = collectPresidentialSessionCookies()
+  local bestName, bestValue = nil, nil
+  for name, value in pairs(map) do
+    if isPrivateDeviceCookieName(name) and type(value) == "string" and value ~= "" then
+      if not bestName or name < bestName then
+        bestName, bestValue = name, value
+      end
+    end
+  end
+  return bestName, bestValue
+end
+
+function getMfaLsoQueryValue()
+  local _, value = getPrimaryPrivateDeviceCookie()
+  if type(value) ~= "string" or value == "" then
+    return ""
+  end
+  return MM.urlencode(value)
+end
+
+function buildLoginRedirectUrl(mfaLso)
+  local lso = mfaLso
+  if lso == nil then
+    lso = getMfaLsoQueryValue()
+  end
+  return CONSTANTS.authApi .. "/login/redirect?mfaLSO=" .. tostring(lso or "")
+end
+
+function ensurePrivateDeviceCookiesApplied(storage, accountKey)
+  if not storage then
+    return hasPrivateDeviceCookie()
+  end
+  local private = getPrivateDeviceCookieSnapshot(storage, accountKey)
+  if type(private) == "table" and next(private) then
+    applySessionCookieMap(private)
+    session.deviceRegisteredPrivate = true
+  else
+    local saved = getPersistedSessionSnapshot(storage, accountKey)
+    if saved and saved.deviceRegisteredPrivate then
+      session.deviceRegisteredPrivate = true
+    end
+  end
+  return hasPrivateDeviceCookie()
+end
+
+function describePrivateDeviceCookieNames()
+  local names = {}
+  local map = extractPrivateDeviceCookieMap(collectPresidentialSessionCookies())
+  for name in pairs(map) do
+    names[#names + 1] = name
+  end
+  table.sort(names)
+  if #names == 0 then
+    return "-"
+  end
+  return table.concat(names, ",")
+end
+
+function countTableKeys(t)
+  local n = 0
+  if type(t) ~= "table" then
+    return 0
+  end
+  for _ in pairs(t) do
+    n = n + 1
+  end
+  return n
+end
+
+function cookieMapToHeader(cookieMap)
+  if type(cookieMap) ~= "table" then
+    return ""
+  end
+  local parts = {}
+  for name, value in pairs(cookieMap) do
+    if type(name) == "string"
+        and type(value) == "string"
+        and name ~= ""
+        and value ~= "" then
+      parts[#parts + 1] = name .. "=" .. value
+    end
+  end
+  table.sort(parts)
+  return table.concat(parts, "; ")
+end
+
+function privateDeviceCookieMapFromHeader(cookieHeader)
+  return extractPrivateDeviceCookieMap(sessionCookiesFromHeader(cookieHeader or ""))
+end
+
+function diagnosePersistedPrivateDevice(storage, accountKey)
+  if not storage then
+    return "storage=nil"
+  end
+  accountKey = accountKey or ""
+  local private = getPrivateDeviceCookieSnapshot(storage, accountKey)
+  local dedicated = type(storage.presidentialPrivateDeviceCookies) == "table"
+      and next(storage.presidentialPrivateDeviceCookies) ~= nil
+  local header = storage.presidentialPrivateDeviceCookieHeader
+  local headerLen = type(header) == "string" and #header or 0
+  local dedicatedKey = tostring(storage.presidentialPrivateDeviceAccountKey or "")
+  local mapEntry = storage.connectionsByAccount
+      and storage.connectionsByAccount[accountKey]
+  local mapCookies = mapEntry and type(mapEntry.sessionCookies) == "table"
+  return "dedicated="
+    .. tostring(dedicated)
+    .. " headerLen="
+    .. tostring(headerLen)
+    .. " mapCookies="
+    .. tostring(mapCookies == true)
+    .. " privateCount="
+    .. tostring(countTableKeys(private))
+    .. " keys="
+    .. dedicatedKey
+    .. "/"
+    .. tostring(accountKey)
+end
+
+function persistPrivateDeviceCookieSlot(storage, accountKey, privateCookies)
+  if not storage or type(privateCookies) ~= "table" or not next(privateCookies) then
+    return
+  end
+  storage.presidentialPrivateDeviceCookies = privateCookies
+  storage.presidentialPrivateDeviceAccountKey = accountKey or ""
+  -- Shareview-/API-Muster: Cookie-Header-String ist über MM-Neustart robuster
+  -- als nested tables unter connectionsByAccount.
+  storage.presidentialPrivateDeviceCookieHeader = cookieMapToHeader(privateCookies)
+end
+
+function clearInMemorySessionCookies()
+  session.cookies = ""
+  session.rftoken = nil
+  session.csrfToken = nil
+  session.deviceRegisteredPrivate = nil
+  session.loginComplete = nil
+end
+
 function handleLoginStep1(credentials)
   local username = credentials[1]
   local password = credentials[2]
@@ -158,18 +376,31 @@ function handleLoginStep1(credentials)
     storage.connectionAccountKey = accountKey
   end
 
+  -- Private-Device-Cookies vor Passwort-Login erneut anwenden (nach totlem SESSION_TOKEN).
+  ensurePrivateDeviceCookiesApplied(storage, accountKey)
+  local mfaLso = getMfaLsoQueryValue()
+  if mfaLso ~= "" then
+    MM.printStatus("Presidential Bank: Private Device Cookie für mfaLSO vorhanden.")
+  else
+    MM.printStatus(
+      "Presidential Bank: Kein Private Device Cookie — MFA erwartet ("
+        .. diagnosePersistedPrivateDevice(storage, accountKey)
+        .. ")."
+    )
+  end
+
   local loginFormData = "testcookie=false&testjs=true&dscheck=1&userid=" .. MM.urlencode(username) .. "&password=" .. MM.urlencode(password)
   local externalResponse = connection:request(
     "POST",
     CONSTANTS.authApi .. "/external-login",
     loginFormData,
     "application/x-www-form-urlencoded",
-    {
+    withCookieHeader({
       ["Accept"] = "application/json, text/plain, */*",
       ["Content-Type"] = "application/x-www-form-urlencoded",
       ["Origin"] = CONSTANTS.baseUrl,
       ["Referer"] = CONSTANTS.baseUrl .. "/dbank/live/app/external-login"
-    }
+    })
   )
 
   if not externalResponse then
@@ -187,10 +418,10 @@ function handleLoginStep1(credentials)
     return loginError
   end
 
-  -- POST to login/redirect
+  -- POST to login/redirect — mfaLSO trägt den Private-Device-Token (Browser: MFA Last Sign-On).
   local redirectResponse = connection:request(
     "POST",
-    CONSTANTS.authApi .. "/login/redirect?mfaLSO=",
+    buildLoginRedirectUrl(mfaLso),
     "{}",
     "application/json",
     withCookieHeader({
@@ -214,6 +445,12 @@ function handleLoginStep1(credentials)
   local redirectError = classifyLoginRedirectError(redirectData)
   if redirectError then
     return redirectError
+  end
+
+  -- Private-Device-Cookie ersetzt OTP: Redirect kann bereits eingeloggt sein.
+  if not loginRedirectRequiresMfa(redirectData, redirectResponse) then
+    MM.printStatus("Presidential Bank: MFA übersprungen (Private Device / Redirect).")
+    return finalizeLogin(redirectResponse)
   end
 
   return getMfaConfig()
@@ -245,6 +482,13 @@ function getMfaConfig()
   session.mfaMethods = extractMfaMethods(mfaData)
 
   if #session.mfaMethods == 0 then
+    if session.deviceRegisteredPrivate or hasPrivateDeviceCookie() then
+      local finalized = finalizeLogin(mfaConfigResponse)
+      if finalized == nil then
+        MM.printStatus("Presidential Bank: MFA-Config ohne Methoden — Private Device Login.")
+        return nil
+      end
+    end
     session.waitingForMfaCode = true
     return mfaCodeChallenge(nil)
   end
@@ -480,11 +724,20 @@ function verifyMfaCode(code)
   end
 
   applyResponseCookies(mfaHeaders)
+  extractMafCookiesFromText(mfaResponse)
+  if type(mfaHeaders) == "string" then
+    extractMafCookiesFromText(mfaHeaders)
+  end
   syncSessionCookies()
   markPrivateDeviceFromCookies()
+  -- MFA-Response kann Private-Device-Cookies auch im JSON liefern.
+  local mfaData = parseJson(mfaResponse)
+  if mfaData then
+    updateDevicePrivateFromAuthtoken(mfaResponse)
+  end
 
   if not isMfaSuccess(mfaResponse) then
-    local data = parseJson(mfaResponse)
+    local data = mfaData or parseJson(mfaResponse)
     if not data then
       session.waitingForMfaCode = false
       return "MFA verification failed: Invalid server response"
@@ -505,7 +758,54 @@ function verifyMfaCode(code)
   end
 
   session.waitingForMfaCode = false
+  local storage = rawget(_G, "LocalStorage")
+  if hasPrivateDeviceCookie() then
+    session.deviceRegisteredPrivate = true
+    persistSessionState(storage)
+    MM.printStatus(
+      "Presidential Bank: Private Device Cookie gespeichert ("
+        .. describePrivateDeviceCookieNames()
+        .. ")."
+    )
+  else
+    MM.printStatus(
+      "Presidential Bank: Kein Private Device Cookie nach MFA (headers="
+        .. summarizeResponseHeaders(mfaHeaders)
+        .. ") — nach Neustart erneut TOTP."
+    )
+  end
   return finalizeLogin(mfaResponse)
+end
+
+function summarizeResponseHeaders(headers)
+  if headers == nil then
+    return "nil"
+  end
+  local headerType = type(headers)
+  if headerType == "string" then
+    return "string:" .. tostring(#headers)
+  end
+  if headerType ~= "table" then
+    return headerType
+  end
+  local keys = {}
+  for key in pairs(headers) do
+    keys[#keys + 1] = tostring(key)
+  end
+  table.sort(keys)
+  if #keys == 0 then
+    return "table:empty"
+  end
+  return "table:" .. table.concat(keys, ",")
+end
+
+function extractMafCookiesFromText(text)
+  if type(text) ~= "string" or text == "" then
+    return
+  end
+  for name, value in text:gmatch("(MAF_IB_[%w%-%_]+)=([^%s;\"'&,]+)") do
+    mergeSessionCookie(name, value)
+  end
 end
 
 function isMfaSessionError(data)
@@ -586,6 +886,7 @@ function applyResponseCookies(headers)
         applySetCookieLine(cookieLine)
       end
     end
+    extractMafCookiesFromText(headers)
     return
   end
 
@@ -601,6 +902,11 @@ function applyResponseCookies(headers)
         end
       else
         applySetCookieLine(tostring(value))
+      end
+    elseif type(key) == "number" and type(value) == "string" then
+      local cookieLine = value:match("^[Ss]et%-[Cc]ookie:%s*(.+)$")
+      if cookieLine then
+        applySetCookieLine(cookieLine)
       end
     end
   end
@@ -679,15 +985,64 @@ function collectPresidentialSessionCookies()
   return map
 end
 
-function getPersistedSessionSnapshot(storage)
+function getConnectionEntry(storage, accountKey)
   if not storage then
     return nil
+  end
+  storage.connectionsByAccount = storage.connectionsByAccount or {}
+  accountKey = accountKey or ""
+  local entry = storage.connectionsByAccount[accountKey]
+  if not entry then
+    entry = {}
+    storage.connectionsByAccount[accountKey] = entry
+  end
+  return entry
+end
+
+function mirrorActivePresidentialSession(storage, accountKey, entry)
+  if not storage or not entry then
+    return
+  end
+  -- Connection bewusst nicht spiegeln (nicht serialisierbar über MM-Neustart).
+  storage.connection = nil
+  storage.connectionAccountKey = accountKey
+  storage.presidentialSessionCookies = entry.sessionCookies
+  storage.presidentialSessionAccountKey = accountKey
+  storage.presidentialRftoken = entry.rftoken
+  storage.presidentialCsrfToken = entry.csrfToken
+  storage.presidentialDevicePrivate = entry.deviceRegisteredPrivate == true
+  storage.presidentialLoginComplete = entry.loginComplete == true
+  storage.presidentialSession = nil
+end
+
+function getPersistedSessionSnapshot(storage, accountKey)
+  if not storage then
+    return nil
+  end
+  accountKey = accountKey or storage.connectionAccountKey or ""
+  local map = storage.connectionsByAccount
+  local entry = map and map[accountKey]
+  if entry and type(entry.sessionCookies) == "table" then
+    return {
+      accountKey = accountKey,
+      sessionCookies = entry.sessionCookies,
+      rftoken = entry.rftoken,
+      csrfToken = entry.csrfToken,
+      deviceRegisteredPrivate = entry.deviceRegisteredPrivate == true,
+      loginComplete = entry.loginComplete == true
+    }
   end
   if type(storage.presidentialSessionCookies) ~= "table" then
     return nil
   end
+  local legacyKey = storage.presidentialSessionAccountKey or ""
+  -- Empty/partial map entry (e.g. after MM restart drops Connection): reuse the
+  -- top-level mirror only when it belongs to this login — never steal another.
+  if entry ~= nil and not accountKeysMatch(legacyKey, accountKey) then
+    return nil
+  end
   return {
-    accountKey = storage.presidentialSessionAccountKey or "",
+    accountKey = legacyKey,
     sessionCookies = storage.presidentialSessionCookies,
     rftoken = storage.presidentialRftoken,
     csrfToken = storage.presidentialCsrfToken,
@@ -696,9 +1051,18 @@ function getPersistedSessionSnapshot(storage)
   }
 end
 
-function clearPersistedSessionStorage(storage)
+function clearPersistedSessionStorage(storage, accountKey)
   if not storage then
     return
+  end
+  local key = accountKey or storage.connectionAccountKey or ""
+  local entry = storage.connectionsByAccount and storage.connectionsByAccount[key]
+  if entry then
+    entry.sessionCookies = nil
+    entry.rftoken = nil
+    entry.csrfToken = nil
+    entry.deviceRegisteredPrivate = nil
+    entry.loginComplete = nil
   end
   storage.presidentialSession = nil
   storage.presidentialSessionCookies = nil
@@ -707,21 +1071,173 @@ function clearPersistedSessionStorage(storage)
   storage.presidentialCsrfToken = nil
   storage.presidentialDevicePrivate = nil
   storage.presidentialLoginComplete = nil
+  if accountKeysMatch(storage.presidentialPrivateDeviceAccountKey or "", key) or key == "" then
+    storage.presidentialPrivateDeviceCookies = nil
+    storage.presidentialPrivateDeviceAccountKey = nil
+    storage.presidentialPrivateDeviceCookieHeader = nil
+  end
+end
+
+function isSessionScopedCookieName(name)
+  if type(name) ~= "string" or name == "" then
+    return false
+  end
+  if isPrivateDeviceCookieName(name) then
+    return false
+  end
+  return name == "SESSION_TOKEN"
+      or name == "SESSION"
+      or name == "FMISSESSIONID"
+      or name == "CSRFToken"
+      or name == "rftoken"
+      or name == "tkt"
+      or name == "at"
+      or name == "ag"
+end
+
+function extractPrivateDeviceCookieMap(cookieMap)
+  local private = {}
+  if type(cookieMap) ~= "table" then
+    return private
+  end
+  for name, value in pairs(cookieMap) do
+    if isPrivateDeviceCookieName(name)
+        and type(value) == "string"
+        and value ~= "" then
+      private[name] = value
+    end
+  end
+  return private
+end
+
+function filterOutSessionScopedCookies(cookieMap)
+  local kept = {}
+  if type(cookieMap) ~= "table" then
+    return kept
+  end
+  for name, value in pairs(cookieMap) do
+    if type(name) == "string"
+        and type(value) == "string"
+        and value ~= ""
+        and not isSessionScopedCookieName(name) then
+      kept[name] = value
+    end
+  end
+  return kept
+end
+
+function clearStaleSessionTokens(storage, accountKey)
+  if not storage then
+    return
+  end
+  local key = accountKey or storage.connectionAccountKey or ""
+  local entry = storage.connectionsByAccount and storage.connectionsByAccount[key]
+  local kept = {}
+  local keepPrivate = false
+  if entry and type(entry.sessionCookies) == "table" then
+    kept = filterOutSessionScopedCookies(entry.sessionCookies)
+    keepPrivate = entry.deviceRegisteredPrivate == true or hasPrivateDeviceCookieInMap(kept)
+  end
+  if type(storage.presidentialSessionCookies) == "table" then
+    local legacyKept = filterOutSessionScopedCookies(storage.presidentialSessionCookies)
+    for name, value in pairs(legacyKept) do
+      kept[name] = value
+    end
+    keepPrivate = keepPrivate
+        or storage.presidentialDevicePrivate == true
+        or hasPrivateDeviceCookieInMap(kept)
+  end
+  keepPrivate = keepPrivate or hasPrivateDeviceCookieInMap(kept)
+  local dedicated = extractPrivateDeviceCookieMap(
+    type(storage.presidentialPrivateDeviceCookies) == "table"
+        and storage.presidentialPrivateDeviceCookies
+        or {}
+  )
+  for name, value in pairs(dedicated) do
+    kept[name] = value
+  end
+  keepPrivate = keepPrivate or next(dedicated) ~= nil
+  if entry then
+    entry.sessionCookies = next(kept) and kept or nil
+    entry.rftoken = nil
+    entry.csrfToken = nil
+    entry.loginComplete = nil
+    entry.deviceRegisteredPrivate = keepPrivate or nil
+  end
+  storage.presidentialSession = nil
+  storage.presidentialSessionCookies = next(kept) and kept or nil
+  storage.presidentialRftoken = nil
+  storage.presidentialCsrfToken = nil
+  storage.presidentialLoginComplete = nil
+  storage.presidentialDevicePrivate = keepPrivate or nil
+  if keepPrivate and key ~= "" then
+    storage.presidentialSessionAccountKey = key
+    local privateOnly = extractPrivateDeviceCookieMap(kept)
+    if next(privateOnly) then
+      persistPrivateDeviceCookieSlot(storage, key, privateOnly)
+    end
+  elseif not keepPrivate then
+    storage.presidentialSessionAccountKey = nil
+  end
 end
 
 function resetStaleSessionForFreshLogin(storage, accountKey)
+  local preservedPrivate = {}
+  local keepPrivateFlag = session.deviceRegisteredPrivate == true
+  if type(session.cookies) == "string" and session.cookies ~= "" then
+    preservedPrivate = extractPrivateDeviceCookieMap(sessionCookiesFromHeader(session.cookies))
+  end
+  if storage then
+    local dedicated = getPrivateDeviceCookieSnapshot(storage, accountKey)
+    if type(dedicated) == "table" then
+      for name, value in pairs(dedicated) do
+        preservedPrivate[name] = value
+      end
+    end
+    local saved = getPersistedSessionSnapshot(storage, accountKey)
+    if saved and type(saved.sessionCookies) == "table" then
+      for name, value in pairs(extractPrivateDeviceCookieMap(saved.sessionCookies)) do
+        preservedPrivate[name] = value
+      end
+      keepPrivateFlag = keepPrivateFlag or saved.deviceRegisteredPrivate == true
+    end
+    keepPrivateFlag = keepPrivateFlag
+        or storage.presidentialDevicePrivate == true
+        or next(preservedPrivate) ~= nil
+  end
+
   connection = Connection()
   connection.language = "en-US"
   connection.useragent = "Mozilla/5.0 (Macintosh; Intel Mac OS X 10_15_7) AppleWebKit/605.1.15"
   session = {}
+  if keepPrivateFlag or next(preservedPrivate) then
+    session.deviceRegisteredPrivate = true
+  end
   if storage then
-    storage.connection = connection
-    storage.connectionAccountKey = accountKey
+    local entry = getConnectionEntry(storage, accountKey)
+    entry.connection = nil
+    entry.sessionCookies = next(preservedPrivate) and preservedPrivate or nil
+    entry.rftoken = nil
+    entry.csrfToken = nil
+    entry.deviceRegisteredPrivate = session.deviceRegisteredPrivate == true or nil
+    entry.loginComplete = nil
+    if next(preservedPrivate) then
+      persistPrivateDeviceCookieSlot(storage, accountKey, preservedPrivate)
+    end
+    mirrorActivePresidentialSession(storage, accountKey, entry)
+    stripNonSerializableConnections(storage)
+  end
+  if next(preservedPrivate) then
+    applySessionCookieMap(preservedPrivate)
   end
 end
 
 function canRestorePersistedSession(storage, accountKey)
-  local saved = getPersistedSessionSnapshot(storage)
+  local dedicated = getPrivateDeviceCookieSnapshot(storage, accountKey)
+  if type(dedicated) == "table" and next(dedicated) then
+    return true
+  end
+  local saved = getPersistedSessionSnapshot(storage, accountKey)
   if not saved then
     return false
   end
@@ -756,39 +1272,119 @@ function persistSessionState(storage)
     accountKey = storage.presidentialSessionAccountKey
   end
   local cookieMap = collectPresidentialSessionCookies()
-  storage.presidentialSessionCookies = cookieMap
-  storage.presidentialSessionAccountKey = accountKey
-  storage.presidentialRftoken = session.rftoken
-  storage.presidentialCsrfToken = session.csrfToken
-  storage.presidentialDevicePrivate = session.deviceRegisteredPrivate == true
-  storage.presidentialLoginComplete = session.loginComplete == true
-  storage.presidentialSession = nil
+  local privateCookies = extractPrivateDeviceCookieMap(cookieMap)
+  local entry = getConnectionEntry(storage, accountKey)
+  -- Nie Connection-Userdata persistieren — sonst verliert MM beim Neustart oft die Cookie-Tabelle.
+  entry.connection = nil
+  entry.sessionCookies = cookieMap
+  entry.rftoken = session.rftoken
+  entry.csrfToken = session.csrfToken
+  entry.deviceRegisteredPrivate = session.deviceRegisteredPrivate == true
+  entry.loginComplete = session.loginComplete == true
+  mirrorActivePresidentialSession(storage, accountKey, entry)
+  -- Dedizierter serialisierbarer Slot nur für Private-Device (TOTP-Skip).
+  persistPrivateDeviceCookieSlot(storage, accountKey, privateCookies)
+  stripNonSerializableConnections(storage)
+end
+
+function getPrivateDeviceCookieSnapshot(storage, accountKey)
+  if not storage then
+    return nil
+  end
+  accountKey = accountKey or storage.connectionAccountKey or ""
+
+  -- 1) Flacher Cookie-Header (Shareview-/API-Muster, am robustesten).
+  if type(storage.presidentialPrivateDeviceCookieHeader) == "string"
+      and storage.presidentialPrivateDeviceCookieHeader ~= "" then
+    local fromHeader =
+      privateDeviceCookieMapFromHeader(storage.presidentialPrivateDeviceCookieHeader)
+    if next(fromHeader) then
+      return fromHeader
+    end
+  end
+
+  -- 2) Dedizierte Cookie-Map. Account-Key nur soft: Private-Device gilt
+  -- installationsweit; striktes Matching hat privateCount=0 trotz dedicated=true
+  -- verursacht (Log 202609042012).
+  local dedicated = storage.presidentialPrivateDeviceCookies
+  if type(dedicated) == "table" and next(dedicated) then
+    local privateOnly = extractPrivateDeviceCookieMap(dedicated)
+    if next(privateOnly) then
+      return privateOnly
+    end
+    -- Fallback: Tabelle enthält Werte, die nicht dem MAF-Namensschema entsprechen
+    -- (ältere/fremde Keys) — trotzdem nicht-leere String-Werte übernehmen.
+    local fallback = {}
+    for name, value in pairs(dedicated) do
+      if type(name) == "string" and type(value) == "string" and value ~= "" then
+        if isPrivateDeviceCookieName(name) or name:match("MAF") or name:lower():match("mfa") then
+          fallback[name] = value
+        end
+      end
+    end
+    if next(fallback) then
+      return fallback
+    end
+  end
+
+  -- 3) Alle Account-Buckets nach MAF-Cookies durchsuchen (Key-Mismatch/Map-Verlust).
+  if type(storage.connectionsByAccount) == "table" then
+    local found = {}
+    for _, entry in pairs(storage.connectionsByAccount) do
+      if type(entry) == "table" and type(entry.sessionCookies) == "table" then
+        for name, value in pairs(extractPrivateDeviceCookieMap(entry.sessionCookies)) do
+          found[name] = value
+        end
+      end
+    end
+    if next(found) then
+      return found
+    end
+  end
+
+  local saved = getPersistedSessionSnapshot(storage, accountKey)
+  if saved and type(saved.sessionCookies) == "table" then
+    local fromSession = extractPrivateDeviceCookieMap(saved.sessionCookies)
+    if next(fromSession) then
+      return fromSession
+    end
+  end
+  return nil
 end
 
 function restorePersistedSessionState(storage, accountKey)
-  local saved = getPersistedSessionSnapshot(storage)
-  if not saved then
+  local saved = getPersistedSessionSnapshot(storage, accountKey)
+  local dedicated = getPrivateDeviceCookieSnapshot(storage, accountKey)
+  if not saved and not (type(dedicated) == "table" and next(dedicated)) then
     return false
   end
-  local privateDevice =
-    saved.deviceRegisteredPrivate or hasPrivateDeviceCookieInMap(saved.sessionCookies)
-  if not accountKeysMatch(saved.accountKey, accountKey) and not privateDevice then
+  local privateDevice = (type(dedicated) == "table" and next(dedicated) ~= nil)
+      or (saved and (
+        saved.deviceRegisteredPrivate or hasPrivateDeviceCookieInMap(saved.sessionCookies)
+      ))
+  if saved and not accountKeysMatch(saved.accountKey, accountKey) and not privateDevice then
     return false
   end
 
-  applySessionCookieMap(saved.sessionCookies)
-  if type(saved.rftoken) == "string" and saved.rftoken ~= "" then
-    session.rftoken = saved.rftoken
-    mergeSessionCookie("rftoken", saved.rftoken)
+  if saved then
+    applySessionCookieMap(saved.sessionCookies)
+    if type(saved.rftoken) == "string" and saved.rftoken ~= "" then
+      session.rftoken = saved.rftoken
+      mergeSessionCookie("rftoken", saved.rftoken)
+    end
+    if type(saved.csrfToken) == "string" and saved.csrfToken ~= "" then
+      session.csrfToken = saved.csrfToken
+    end
+    if saved.deviceRegisteredPrivate then
+      session.deviceRegisteredPrivate = true
+    end
+    if saved.loginComplete then
+      session.loginComplete = true
+    end
   end
-  if type(saved.csrfToken) == "string" and saved.csrfToken ~= "" then
-    session.csrfToken = saved.csrfToken
-  end
-  if saved.deviceRegisteredPrivate then
+  if type(dedicated) == "table" and next(dedicated) then
+    applySessionCookieMap(dedicated)
     session.deviceRegisteredPrivate = true
-  end
-  if saved.loginComplete then
-    session.loginComplete = true
   end
   return true
 end
@@ -820,25 +1416,33 @@ function tryVerifyPersistedSession(storage, accountKey)
     return nil
   end
 
-  clearPersistedSessionStorage(storage)
+  -- SESSION_TOKEN ist nach MoneyMoney-Neustart oft tot; Private-Device-Cookies
+  -- (MAF_IB_*) dürfen dabei nicht gelöscht werden — sie ersetzen TOTP.
+  MM.printStatus("Presidential Bank: Session-Token ungültig — Private Device behalten.")
+  clearStaleSessionTokens(storage, accountKey)
   resetStaleSessionForFreshLogin(storage, accountKey)
   return false
 end
 
 function tryConnectionJarLogin(storage, accountKey)
-  if not storage or not storage.connection then
+  if not storage or not connection then
     return false
   end
+  -- Nur modul-lokale Connection (nie aus LocalStorage — nicht serialisierbar).
+  if storage.connectionAccountKey and accountKey ~= "" then
+    if not accountKeysMatch(storage.connectionAccountKey, accountKey)
+        and not hasPrivateDeviceCookie()
+        and not getPrivateDeviceCookieSnapshot(storage, accountKey) then
+      return false
+    end
+  end
+  storage.connectionAccountKey = accountKey
   syncSessionCookies()
+  ensurePrivateDeviceCookiesApplied(storage, accountKey)
   local hasSessionToken = session.cookies and session.cookies:match("SESSION_TOKEN")
   local hasPrivate = hasPrivateDeviceCookie()
   if not hasSessionToken and not hasPrivate then
     return false
-  end
-  if storage.connectionAccountKey and accountKey ~= "" then
-    if not accountKeysMatch(storage.connectionAccountKey, accountKey) and not hasPrivate then
-      return false
-    end
   end
   return tryVerifyPersistedSession(storage, accountKey)
 end
@@ -864,8 +1468,24 @@ function updateDevicePrivateFromAuthtoken(content)
   if data.mfaInfo.computerPrivate == true then
     session.deviceRegisteredPrivate = true
   end
-  if type(data.mfaInfo.mfaCookies) == "table" and #data.mfaInfo.mfaCookies > 0 then
-    session.deviceRegisteredPrivate = true
+  if type(data.mfaInfo.mfaCookies) == "table" then
+    local applied = false
+    for _, cookie in ipairs(data.mfaInfo.mfaCookies) do
+      if type(cookie) == "table" then
+        local name = cookie.name or cookie.cookieName
+        local value = cookie.value or cookie.cookieValue
+        if type(name) == "string" and type(value) == "string" and name ~= "" and value ~= "" then
+          mergeSessionCookie(name, value)
+          applied = true
+        end
+      elseif type(cookie) == "string" and cookie ~= "" then
+        applySetCookieLine(cookie)
+        applied = true
+      end
+    end
+    if applied or #data.mfaInfo.mfaCookies > 0 then
+      session.deviceRegisteredPrivate = true
+    end
   end
 end
 
@@ -874,7 +1494,7 @@ function hasPrivateDeviceCookieInMap(cookieMap)
     return false
   end
   for name in pairs(cookieMap) do
-    if type(name) == "string" and name:match("^MAF_IB_") then
+    if isPrivateDeviceCookieName(name) then
       return true
     end
   end
@@ -883,8 +1503,13 @@ end
 
 function hasPrivateDeviceCookie(cookies)
   cookies = cookies or session.cookies or ""
-  if cookies:match("MAF_IB_") then
-    return true
+  if type(cookies) == "string" then
+    for pair in cookies:gmatch("[^;]+") do
+      local name = pair:match("^%s*([^=]+)=")
+      if name and isPrivateDeviceCookieName(trim(name)) then
+        return true
+      end
+    end
   end
   return hasPrivateDeviceCookieInMap(sessionCookiesFromHeader(cookies))
 end
@@ -1123,6 +1748,9 @@ function finalizeLogin(mfaResponse)
 
   collectRftokenFromResponses(authtokenContent, mfaResponse)
   updateDevicePrivateFromAuthtoken(authtokenContent)
+  if hasPrivateDeviceCookie() then
+    session.deviceRegisteredPrivate = true
+  end
 
   if verifySessionWithAccounts() or verifySessionWithHistory() then
     session.loginComplete = true
@@ -1697,6 +2325,9 @@ function EndSession()
 
   if session.persistedConnection and storage and session.loginComplete then
     persistSessionState(storage)
+    -- Connection-Userdata ist nicht serialisierbar: ohne Entfernen gehen
+    -- sessionCookies beim MoneyMoney-Neustart oft verloren (TOTP jedes Mal).
+    stripNonSerializableConnections(storage)
     return
   end
 
@@ -1710,5 +2341,20 @@ function EndSession()
   end
 
   session = {}
+end
+
+function stripNonSerializableConnections(storage)
+  if not storage then
+    return
+  end
+  storage.connection = nil
+  if type(storage.connectionsByAccount) ~= "table" then
+    return
+  end
+  for _, entry in pairs(storage.connectionsByAccount) do
+    if type(entry) == "table" then
+      entry.connection = nil
+    end
+  end
 end
 

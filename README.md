@@ -1,8 +1,8 @@
 # Presidential Bank — MoneyMoney Extension
 Plugin Homepage: https://github.com/rosch100/Presidential-Bank-MoneyMoney
 Bank/Portal: https://www.presidentialpcbanking.com
-Version: **1.01**
-Status: Username/Passwort + MFA; Cookie-Import optional
+Version: **1.09**
+Status: Username/Passwort + MFA; Cookie-Import optional; Private-Device-Cookie überlebt MoneyMoney-Neustart (kein TOTP jedes Mal)
 Hub (gemeinsame Tools/Doku): https://github.com/rosch100/moneymoney-extensions
 Optional Cookie-Import: `COOKIE:SESSION_TOKEN=…;rftoken=…`.
 ## Installation
