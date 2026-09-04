@@ -387,6 +387,21 @@ do
         return { resultURL = "https://evil.example/phish" }
       end }
     end
+    if str == "absHttp" then
+      return { dictionary = function()
+        return { resultURL = "http://www.presidentialpcbanking.com/dbank/live/app/postLogin" }
+      end }
+    end
+    if str == "absBadPath" then
+      return { dictionary = function()
+        return { resultURL = "https://www.presidentialpcbanking.com/evil" }
+      end }
+    end
+    if str == "unknownRel" then
+      return { dictionary = function()
+        return { resultURL = "/unknown/path" }
+      end }
+    end
     return { dictionary = function() return nil end }
   end
 
@@ -405,6 +420,22 @@ do
     type(errEvil) == "string" and errEvil:find("nicht erlaubt", 1, true) ~= nil,
     true,
     "extractPostLoginUrl.absEvil.message")
+
+  local okHttp, errHttp = pcall(extractPostLoginUrl, "absHttp")
+  assertEq(okHttp, false, "extractPostLoginUrl.absHttp.throws")
+  assertEq(
+    type(errHttp) == "string" and errHttp:find("https", 1, true) ~= nil,
+    true,
+    "extractPostLoginUrl.absHttp.message")
+
+  local okPath, errPath = pcall(extractPostLoginUrl, "absBadPath")
+  assertEq(okPath, false, "extractPostLoginUrl.absBadPath.throws")
+  assertEq(
+    type(errPath) == "string" and errPath:find("Pfad", 1, true) ~= nil,
+    true,
+    "extractPostLoginUrl.absBadPath.message")
+
+  assertEq(extractPostLoginUrl("unknownRel"), nil, "extractPostLoginUrl.unknownRel")
 
   assertEq(extractRftokenFromText('{"rftoken":"RF-123"}'), "RF-123", "extractRftokenFromText.json")
 end

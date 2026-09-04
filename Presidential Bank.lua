@@ -1072,12 +1072,20 @@ function extractPostLoginUrl(mfaResponse)
   end
 
   if resultUrl:match("^https?://") then
-    local host = resultUrl:match("^https?://([^/]+)")
+    if not resultUrl:match("^https://") then
+      error("Presidential Bank: resultURL nur https:// erlaubt")
+    end
+    local host = resultUrl:match("^https://([^/]+)")
     if host then
       host = host:lower():gsub(":443$", ""):gsub(":80$", "")
     end
     if host ~= CONSTANTS.allowedHost then
       error("Presidential Bank: resultURL Host nicht erlaubt: " .. tostring(host))
+    end
+    local path = resultUrl:match("^https://[^/]+(/[^?#]*)") or "/"
+    if not (path:match("^/dbank/") or path:match("^/auth%-olb/")
+        or path:match("^/accts%-olb/") or path:match("^/site%-olb/")) then
+      error("Presidential Bank: resultURL Pfad nicht erlaubt: " .. path)
     end
     return resultUrl
   end
@@ -1087,7 +1095,7 @@ function extractPostLoginUrl(mfaResponse)
   if resultUrl:match("^/dbank/") then
     return CONSTANTS.baseUrl .. resultUrl
   end
-  return CONSTANTS.baseUrl .. resultUrl
+  return nil
 end
 
 function followPostLoginRedirect(mfaResponse)
