@@ -1072,34 +1072,42 @@ function extractPostLoginUrl(mfaResponse)
   end
 
   if resultUrl:match("^https?://") then
-    if not resultUrl:match("^https://") then
-      error("Presidential Bank: resultURL nur https:// erlaubt")
-    end
-    local host = resultUrl:match("^https://([^/]+)")
-    if host then
-      host = host:lower():gsub(":443$", ""):gsub(":80$", "")
-    end
-    if host ~= CONSTANTS.allowedHost then
-      error("Presidential Bank: resultURL Host nicht erlaubt: " .. tostring(host))
-    end
-    local path = resultUrl:match("^https://[^/]+(/[^?#]*)") or "/"
-    if not (path:match("^/dbank/") or path:match("^/auth%-olb/")
-        or path:match("^/accts%-olb/") or path:match("^/site%-olb/")) then
-      error("Presidential Bank: resultURL Pfad nicht erlaubt: " .. path)
-    end
-    return resultUrl
+    return assertAllowedPostLoginUrl(resultUrl)
   end
   if resultUrl:match("^/app/") then
-    return CONSTANTS.baseUrl .. "/dbank/live" .. resultUrl
+    return assertAllowedPostLoginUrl(CONSTANTS.baseUrl .. "/dbank/live" .. resultUrl)
   end
   if resultUrl:match("^/dbank/") then
-    return CONSTANTS.baseUrl .. resultUrl
+    return assertAllowedPostLoginUrl(CONSTANTS.baseUrl .. resultUrl)
   end
   return nil
 end
 
+function assertAllowedPostLoginUrl(url)
+  if type(url) ~= "string" or url == "" then
+    error("Presidential Bank: postLogin URL fehlt")
+  end
+  if not url:match("^https://") then
+    error("Presidential Bank: resultURL nur https:// erlaubt")
+  end
+  local host = url:match("^https://([^/]+)")
+  if host then
+    host = host:lower():gsub(":443$", ""):gsub(":80$", "")
+  end
+  if host ~= CONSTANTS.allowedHost then
+    error("Presidential Bank: resultURL Host nicht erlaubt: " .. tostring(host))
+  end
+  local path = url:match("^https://[^/]+(/[^?#]*)") or "/"
+  if not (path:match("^/dbank/") or path:match("^/auth%-olb/")
+      or path:match("^/accts%-olb/") or path:match("^/site%-olb/")) then
+    error("Presidential Bank: resultURL Pfad nicht erlaubt: " .. path)
+  end
+  return url
+end
+
 function followPostLoginRedirect(mfaResponse)
   local postLoginUrl = extractPostLoginUrl(mfaResponse) or (CONSTANTS.baseUrl .. "/dbank/live/app/postLogin")
+  postLoginUrl = assertAllowedPostLoginUrl(postLoginUrl)
   connection:request(
     "GET",
     postLoginUrl,
