@@ -414,6 +414,11 @@ do
   local urlAbs = extractPostLoginUrl("absOk")
   assertEq(urlAbs, "https://www.presidentialpcbanking.com/dbank/live/app/postLogin", "extractPostLoginUrl.absOk")
 
+  assertEq(
+    assertAllowedPostLoginUrl("https://www.presidentialpcbanking.com/dbank/live/app/postLogin?x=1"),
+    "https://www.presidentialpcbanking.com/dbank/live/app/postLogin?x=1",
+    "assertAllowedPostLoginUrl.queryOk")
+
   local okEvil, errEvil = pcall(extractPostLoginUrl, "absEvil")
   assertEq(okEvil, false, "extractPostLoginUrl.absEvil.throws")
   assertEq(
