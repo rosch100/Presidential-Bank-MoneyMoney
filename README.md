@@ -8,14 +8,14 @@ Gemeinsame Infos: https://github.com/rosch100/moneymoney-extensions
 
 ## Installation
 
-Unsignierte Datei:
+Datei (inkl. Adams-Signatur, wie auf moneymoney-app.com):
 [Presidential Bank.lua](https://raw.githubusercontent.com/rosch100/Presidential-Bank-MoneyMoney/main/Presidential%20Bank.lua)
 
 Datei nach
 `~/Library/Containers/com.moneymoney-app.retail/Data/Library/Application Support/MoneyMoney/Extensions`
 kopieren, oder im Klon `./link_ext.sh` ausführen.
 
-Unsignierte Plugins: MoneyMoney-**Beta**, Signaturprüfung unter
+Entwicklungs-Plugins ohne gültige Signatur: MoneyMoney-**Beta**, Signaturprüfung unter
 *MoneyMoney → Einstellungen → Erweiterungen* ausschalten.
 
 ## Einrichten
