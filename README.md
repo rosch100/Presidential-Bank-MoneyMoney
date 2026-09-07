@@ -8,7 +8,7 @@ Gemeinsame Infos: https://github.com/rosch100/moneymoney-extensions
 
 ## Installation
 
-Datei (inkl. Adams-Signatur, wie auf moneymoney-app.com):
+Datei (inkl. MoneyMoney Signatur, wie auf moneymoney-app.com):
 [Presidential Bank.lua](https://raw.githubusercontent.com/rosch100/Presidential-Bank-MoneyMoney/main/Presidential%20Bank.lua)
 
 Datei nach
