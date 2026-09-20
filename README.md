@@ -31,6 +31,12 @@ eingeben. Optional Cookie-Import (`COOKIE:…`) —
 Nach dem Einrichten den Zugang aktualisieren. Wurde das Gerät einmal freigeschaltet,
 ist beim nächsten Start oft kein neuer Code nötig.
 
+## Fehler & Ideen
+
+Issues bitte über GitHub melden:
+[Neues Issue](https://github.com/rosch100/Presidential-Bank-MoneyMoney/issues/new/choose).
+Keine MoneyMoney-Logdateien anhängen — Details stehen im Bug-Formular.
+
 ## Lizenz
 
 MIT — siehe [LICENSE](LICENSE).
