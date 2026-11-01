@@ -139,7 +139,7 @@ function loginRedirectRequiresMfa(redirectData, redirectResponse)
   end
 
   -- Log 2026-09-04: {"targetData":"nxg-olb/mfa","targetView":"redirect"} → MFA nötig.
-  -- Bare targetView "redirect" is NOT success; isMfaSuccess() would mis-classify it.
+  -- Bare targetView "redirect" is NOT success on its own (siehe Verzweigung in handleLoginStep1).
   local targetData = redirectData.targetData
   if type(targetData) == "string" then
     local dataLower = targetData:lower()
@@ -310,7 +310,6 @@ function diagnosePersistedPrivateDevice(storage, accountKey)
       and next(storage.presidentialPrivateDeviceCookies) ~= nil
   local header = storage.presidentialPrivateDeviceCookieHeader
   local headerLen = type(header) == "string" and #header or 0
-  local dedicatedKey = tostring(storage.presidentialPrivateDeviceAccountKey or "")
   local mapEntry = storage.connectionsByAccount
       and storage.connectionsByAccount[accountKey]
   local mapCookies = mapEntry and type(mapEntry.sessionCookies) == "table"
@@ -322,10 +321,6 @@ function diagnosePersistedPrivateDevice(storage, accountKey)
     .. tostring(mapCookies == true)
     .. " privateCount="
     .. tostring(countTableKeys(private))
-    .. " keys="
-    .. dedicatedKey
-    .. "/"
-    .. tostring(accountKey)
 end
 
 function persistPrivateDeviceCookieSlot(storage, accountKey, privateCookies)
@@ -345,6 +340,21 @@ function clearInMemorySessionCookies()
   session.csrfToken = nil
   session.deviceRegisteredPrivate = nil
   session.loginComplete = nil
+end
+
+function postLoginRedirect(mfaLso)
+  return connection:request(
+    "POST",
+    buildLoginRedirectUrl(mfaLso),
+    "{}",
+    "application/json",
+    withCookieHeader({
+      ["Accept"] = "application/json",
+      ["Content-Type"] = "application/json",
+      ["Origin"] = CONSTANTS.baseUrl,
+      ["Referer"] = CONSTANTS.baseUrl .. "/dbank/live/app/external-login"
+    })
+  )
 end
 
 function handleLoginStep1(credentials)
@@ -418,19 +428,22 @@ function handleLoginStep1(credentials)
     return loginError
   end
 
-  -- POST to login/redirect — mfaLSO trägt den Private-Device-Token (Browser: MFA Last Sign-On).
-  local redirectResponse = connection:request(
-    "POST",
-    buildLoginRedirectUrl(mfaLso),
-    "{}",
-    "application/json",
-    withCookieHeader({
-      ["Accept"] = "application/json",
-      ["Content-Type"] = "application/json",
-      ["Origin"] = CONSTANTS.baseUrl,
-      ["Referer"] = CONSTANTS.baseUrl .. "/dbank/live/app/external-login"
-    })
-  )
+  -- Verzweigung nach external-login, wie im Browser (HAR-Vergleich):
+  -- "redirect" -> Anmeldung ohne MFA, "restore_mfa_redirect" -> login/redirect ohne mfaLSO,
+  -- "redirect_service" -> MFA-Seite.
+  local externalView = extLoginData.targetView
+  if externalView == "redirect" then
+    MM.printStatus("Presidential Bank: Anmeldung ohne MFA (Gerät erkannt).")
+    return finalizeLogin(externalResponse)
+  end
+  if externalView == "redirect_service" then
+    return getMfaConfig()
+  end
+  if externalView ~= "restore_mfa_redirect" then
+    return "Unerwartete Antwort vom Anmeldeserver (targetView=" .. tostring(externalView) .. ")."
+  end
+
+  local redirectResponse = postLoginRedirect("")
 
   if not redirectResponse then
     return "Keine Antwort beim Aufbau der Anmeldesitzung."
@@ -447,118 +460,112 @@ function handleLoginStep1(credentials)
     return redirectError
   end
 
-  -- Private-Device-Cookie ersetzt OTP: Redirect kann bereits eingeloggt sein.
   if not loginRedirectRequiresMfa(redirectData, redirectResponse) then
-    MM.printStatus("Presidential Bank: MFA übersprungen (Private Device / Redirect).")
+    MM.printStatus("Presidential Bank: MFA übersprungen (Redirect).")
     return finalizeLogin(redirectResponse)
   end
 
   return getMfaConfig()
 end
 
-function getMfaConfig()
-  local mfaConfigResponse = connection:request("GET", CONSTANTS.authApi .. "/mfa/config", nil, nil, withCookieHeader({
-    ["Accept"] = "application/json",
-    ["Referer"] = CONSTANTS.baseUrl .. "/dbank/live/app/mfa"
-  }))
+function generateUuid()
+  local template = "xxxxxxxx-xxxx-4xxx-yxxx-xxxxxxxxxxxx"
+  return (template:gsub("[xy]", function(c)
+    local v = (c == "x") and math.random(0, 15) or math.random(8, 11)
+    return string.format("%x", v)
+  end))
+end
 
-  if not mfaConfigResponse then
+function buildMfaBffUrl(path)
+  return CONSTANTS.baseUrl .. "/nxg-olb-bff/live/nxg-ui/v1/authentication/" .. path
+end
+
+function buildMfaBffHeaders(hasJsonBody)
+  local headers = {
+    ["Accept"] = "application/json, text/plain, */*",
+    ["Referer"] = CONSTANTS.baseUrl .. "/nxg-olb/live/mfaVerification",
+    ["channel"] = "web",
+    ["correlationId"] = generateUuid(),
+    ["interactionId"] = generateUuid()
+  }
+  if hasJsonBody then
+    headers["Content-Type"] = "application/json"
+    headers["Origin"] = CONSTANTS.baseUrl
+  end
+  return withCookieHeader(headers)
+end
+
+function getMfaConfig()
+  local mfaResponse = connection:request("GET", buildMfaBffUrl("mfa"), nil, nil, buildMfaBffHeaders(false))
+
+  if not mfaResponse then
     return "Keine Antwort beim Laden der MFA-Konfiguration."
   end
 
   syncSessionCookies()
 
-  local mfaData = parseJson(mfaConfigResponse)
-
+  local mfaData = parseJson(mfaResponse)
   if not mfaData then
     return "Ungültige Antwort beim Laden der MFA-Konfiguration."
   end
 
-  session.mfaConfig = mfaData
-  session.csrfToken = extractCsrfToken(mfaData)
-  if session.csrfToken then
-    mergeSessionCookie("CSRFToken", session.csrfToken)
+  local methods, methodsError = extractMfaMethods(mfaData)
+  if not methods then
+    return methodsError
   end
-  session.mfaMethods = extractMfaMethods(mfaData)
+  session.mfaMethods = methods
 
   if #session.mfaMethods == 0 then
-    if session.deviceRegisteredPrivate or hasPrivateDeviceCookie() then
-      local finalized = finalizeLogin(mfaConfigResponse)
-      if finalized == nil then
-        MM.printStatus("Presidential Bank: MFA-Config ohne Methoden — Private Device Login.")
-        return nil
-      end
+    if hasPrivateDeviceCookie() then
+      MM.printStatus("Presidential Bank: MFA-Config ohne Methoden — Private Device Login.")
+      return finalizeLogin(mfaResponse)
     end
-    session.waitingForMfaCode = true
-    return mfaCodeChallenge(nil)
+    return "Keine MFA-Methode bei Presidential Bank hinterlegt."
   end
 
   session.waitingForMethodSelection = true
   return buildMfaSelectionChallenge()
 end
 
-function extractCsrfToken(mfaData)
-  if mfaData.pageProps and mfaData.pageProps.CSRFToken then
-    return mfaData.pageProps.CSRFToken
-  elseif mfaData.targetData and mfaData.targetData.CSRFToken then
-    return mfaData.targetData.CSRFToken
-  elseif mfaData.globalEnvProps and mfaData.globalEnvProps.globalIFS then
-    return mfaData.globalEnvProps.globalIFS.guid
-  end
-  return nil
-end
-
+-- Methoden aus der Antwort von nxg-ui/v1/authentication/mfa.
+-- Die Antwort listet nur bereits validierte Methoden (TOTP, Telefonnummern, E-Mail).
+-- Gibt bei fehlenden Pflichtfeldern nil und eine Fehlermeldung zurück.
 function extractMfaMethods(mfaData)
   local methods = {}
 
-  if not (mfaData.targetData and mfaData.targetData.destinations) then
-    return methods
+  if type(mfaData.validatedTotpToken) == "table" and mfaData.validatedTotpToken.id then
+    table.insert(methods, buildMfaMethod("TOTP", mfaData.validatedTotpToken.id, "Authenticator App (TOTP)", "totp"))
   end
 
-  local destinations = mfaData.targetData.destinations
-  if type(destinations) == "string" then
-    destinations = parseJson(destinations) or {}
-  end
-
-  if type(destinations) ~= "table" then
-    return methods
-  end
-
-  for _, dest in ipairs(destinations) do
-    if dest.activated then
-      local method = buildMfaMethod(dest)
-      if method then
-        table.insert(methods, method)
+  if type(mfaData.validatedPhoneNumbers) == "table" then
+    for _, phone in ipairs(mfaData.validatedPhoneNumbers) do
+      if type(phone) ~= "table" then
+        return nil, "Ungültiger Telefoneintrag in der MFA-Konfiguration."
+      end
+      if (phone.SMS_id or phone.voice_id) and phone.number == nil then
+        return nil, "Telefonnummer fehlt in der MFA-Konfiguration."
+      end
+      if phone.SMS_id then
+        table.insert(methods, buildMfaMethod("SMS", phone.SMS_id, "Text me at " .. phone.number, "sms"))
+      end
+      if phone.voice_id then
+        table.insert(methods, buildMfaMethod("VOICE", phone.voice_id, "Call me at " .. phone.number, "voice"))
       end
     end
+  end
+
+  if type(mfaData.validatedEmail) == "table" and mfaData.validatedEmail.id then
+    if mfaData.validatedEmail.address == nil then
+      return nil, "E-Mail-Adresse fehlt in der MFA-Konfiguration."
+    end
+    table.insert(methods, buildMfaMethod("EMAIL", mfaData.validatedEmail.id, "Email me at " .. mfaData.validatedEmail.address, "email"))
   end
 
   return methods
 end
 
-function buildMfaMethod(dest)
-  local method = {
-    id = dest.id and dest.id.value,
-    protocol = dest.protocol,
-    contactInfo = dest.contactInfo or "",
-    telephoneCountryCode = dest.telephoneCountryCode
-  }
-
-  local protocolMap = {
-    TOTP = { name = "Authenticator App (TOTP)", type = "totp" },
-    SMS = { name = "Text me at " .. method.contactInfo, type = "sms" },
-    VOICE = { name = "Call me at " .. method.contactInfo, type = "voice" },
-    EMAIL = { name = "Email me at " .. method.contactInfo, type = "email" }
-  }
-
-  local mapped = protocolMap[dest.protocol]
-  if not mapped then
-    return nil
-  end
-
-  method.name = mapped.name
-  method.type = mapped.type
-  return method
+function buildMfaMethod(protocol, id, name, methodType)
+  return { protocol = protocol, id = id, name = name, type = methodType }
 end
 
 function buildMfaSelectionChallenge(prefix)
@@ -603,31 +610,17 @@ function handleMethodSelection(userInput)
     )
   end
 
-  session.selectedMfaMethod = session.mfaMethods[methodIndex]
-  session.waitingForMethodSelection = false
-  session.waitingForMfaCode = true
-
-  -- TOTP: direkt mfa/submit ohne mfa/select (Browser-Flow).
-  if session.selectedMfaMethod.type ~= "totp" then
-    local buttonError = pressMfaVirtualButton(session.selectedMfaMethod)
-    if buttonError then
-      session.waitingForMethodSelection = true
-      session.waitingForMfaCode = false
-      session.selectedMfaMethod = nil
-      return buildMfaSelectionChallenge(buttonError)
-    end
+  local method = session.mfaMethods[methodIndex]
+  local requestError = requestMfaVerification(method)
+  if requestError then
+    -- Auswahl bleibt offen, damit eine andere Methode gewaehlt werden kann.
+    return buildMfaSelectionChallenge(requestError)
   end
 
-  return mfaCodeChallenge(session.selectedMfaMethod)
-end
-
-function buildMfaSelectUrl(method)
-  return CONSTANTS.authApi .. "/mfa/select?type=" .. method.type
-end
-
-function buildMfaSubmitUrl(method, cookieoptin)
-  local optin = cookieoptin == false and "false" or "true"
-  return CONSTANTS.authApi .. "/mfa/submit?displayMethod=" .. method.protocol .. "&type=OTP&cookieoptin=" .. optin
+  session.selectedMfaMethod = method
+  session.waitingForMethodSelection = false
+  session.waitingForMfaCode = true
+  return mfaCodeChallenge(method)
 end
 
 function jsonEscapeString(value)
@@ -639,60 +632,27 @@ function jsonEscapeString(value)
     :gsub('"', '\\"')
 end
 
-function buildMfaSelectBody(method)
-  session.csrfToken = session.csrfToken or extractCsrfTokenFromCookies(session.cookies) or ""
-  return '{"destId":"' .. jsonEscapeString(method.id) ..
-    '","csrftoken":"' .. jsonEscapeString(session.csrfToken) .. '"}'
-end
-
-function buildMfaSubmitBody(method, code)
-  session.csrfToken = session.csrfToken or extractCsrfTokenFromCookies(session.cookies) or ""
-  local destId = method and method.id
-  if method and method.type == "totp" and not destId then
-    destId = findTotpId() or ""
-  end
-  return '{"destId":"' .. jsonEscapeString(destId or "") ..
-    '","csrftoken":"' .. jsonEscapeString(session.csrfToken) ..
-    '","otp":"' .. jsonEscapeString(code) .. '"}'
-end
-
-function isMfaSelectSuccess(response)
-  if not response or response == "" then
-    return false
-  end
-  local data = parseJson(response)
-  if not data or data.errorCode then
-    return false
-  end
-  return data.result == "success"
-end
-
-function pressMfaVirtualButton(method)
-  session.csrfToken = session.csrfToken or extractCsrfTokenFromCookies(session.cookies) or ""
-
-  local selectUrl = buildMfaSelectUrl(method)
-  local body = buildMfaSelectBody(method)
+-- Fordert den Code fuer eine Methode an (Browser-Schritt "authentication/mfa").
+-- Gibt nil bei Erfolg zurueck, sonst eine Fehlermeldung.
+function requestMfaVerification(method)
+  local body = '{"protocol":"' .. jsonEscapeString(method.protocol) ..
+    '","id":"' .. jsonEscapeString(method.id) .. '"}'
 
   local response, _, _, _, respHeaders = connection:request(
-    "POST",
-    selectUrl,
-    body,
-    "application/json",
-    buildApiHeaders()
+    "POST", buildMfaBffUrl("mfa"), body, "application/json", buildMfaBffHeaders(true)
   )
 
   applyResponseCookies(respHeaders)
   syncSessionCookies()
 
-  if not isMfaSelectSuccess(response) then
-    local data = parseJson(response)
-    if data and data.errorCode then
-      return "MFA-Button fehlgeschlagen (Fehler " .. tostring(data.errorCode) ..
-             "). Bitte andere Methode waehlen oder Login neu starten."
-    end
-    return "MFA-Button fehlgeschlagen. Bitte andere Methode waehlen oder Login neu starten."
+  local data = parseJson(response)
+  if not data or not data.status then
+    return "MFA-Anforderung fehlgeschlagen. Bitte andere Methode waehlen oder Login neu starten."
   end
-
+  if data.status ~= "VERIFICATION_REQUIRED" then
+    return "MFA-Anforderung fehlgeschlagen (Status " .. tostring(data.status) ..
+           "). Bitte andere Methode waehlen oder Login neu starten."
+  end
   return nil
 end
 
@@ -703,6 +663,10 @@ function verifyMfaCode(code)
   end
 
   local method = session.selectedMfaMethod
+  if not method then
+    session.waitingForMfaCode = false
+    return "MFA verification failed: No active session"
+  end
 
   -- Format-Vorpruefung: leere/nicht-numerische Eingabe -> Retry-Challenge.
   if not code or not code:match("^%s*%d+%s*$") then
@@ -710,12 +674,12 @@ function verifyMfaCode(code)
   end
   code = code:gsub("^%s*(.-)%s*$", "%1")
 
-  session.csrfToken = session.csrfToken or extractCsrfTokenFromCookies(session.cookies) or ""
-
-  local submitUrl = buildMfaSubmitUrl(method or { protocol = "TOTP", type = "totp" })
-  local body = buildMfaSubmitBody(method, code)
+  -- privateDevice=true entspricht dem Browser-Haken "Gerät merken".
+  local body = '{"oneTimePasscode":"' .. jsonEscapeString(code) ..
+    '","privateDevice":true,"protocol":"' .. jsonEscapeString(method.protocol) ..
+    '","id":"' .. jsonEscapeString(method.id) .. '"}'
   local mfaResponse, _, _, _, mfaHeaders = connection:request(
-    "POST", submitUrl, body, "application/json", buildApiHeaders()
+    "POST", buildMfaBffUrl("verify"), body, "application/json", buildMfaBffHeaders(true)
   )
 
   if not mfaResponse then
@@ -730,31 +694,17 @@ function verifyMfaCode(code)
   end
   syncSessionCookies()
   markPrivateDeviceFromCookies()
-  -- MFA-Response kann Private-Device-Cookies auch im JSON liefern.
-  local mfaData = parseJson(mfaResponse)
-  if mfaData then
-    updateDevicePrivateFromAuthtoken(mfaResponse)
+
+  local data = parseJson(mfaResponse)
+  if not data or not data.status then
+    session.waitingForMfaCode = false
+    return "MFA verification failed: Invalid server response"
   end
 
-  if not isMfaSuccess(mfaResponse) then
-    local data = mfaData or parseJson(mfaResponse)
-    if not data then
-      session.waitingForMfaCode = false
-      return "MFA verification failed: Invalid server response"
-    end
-    if isMfaSessionError(data) then
-      session.waitingForMfaCode = false
-      return "MFA fehlgeschlagen: Session oder CSRF ungültig (Fehler " ..
-             tostring(data.errorCode) .. "). Bitte Login abbrechen und erneut starten."
-    end
-    if data then
-      local freshCsrf = extractCsrfToken(data)
-      if freshCsrf then
-        session.csrfToken = freshCsrf
-      end
-    end
+  if data.status ~= "AUTHENTICATED" then
+    -- Unbekannte Status werden gemeldet, damit sie nicht stillschweigend verschluckt werden.
     session.waitingForMfaCode = true
-    return mfaCodeChallenge(method, "Invalid code. Please try again.")
+    return mfaCodeChallenge(method, "Code nicht akzeptiert (Status " .. tostring(data.status) .. ").")
   end
 
   session.waitingForMfaCode = false
@@ -806,15 +756,6 @@ function extractMafCookiesFromText(text)
   for name, value in text:gmatch("(MAF_IB_[%w%-%_]+)=([^%s;\"'&,]+)") do
     mergeSessionCookie(name, value)
   end
-end
-
-function isMfaSessionError(data)
-  if not data or data.errorCode == nil then
-    return false
-  end
-  local code = tostring(data.errorCode)
-  -- 10000: Session/CSRF/Request ungültig — kein OTP-Retry (verhindert Endlosschleife)
-  return code == "10000" or code == "99999" or code == "24001"
 end
 
 function trim(value)
@@ -1676,12 +1617,30 @@ function extractRftokenFromText(text)
   return text:match('[Rr][Ff]token[^%w%-_%.]*["\']?([%w%-_%.]+)["\']?')
 end
 
+PASSWORD_RESET_MESSAGE = "Der Server verlangt eine Passwort-Änderung. Bitte das Passwort im Browser bei Presidential Bank ändern und in MoneyMoney aktualisieren."
+
+function isPasswordResetRequired(updateResponse)
+  return type(updateResponse) == "string" and updateResponse:find("/app/authUpdate/resetPassword", 1, true) ~= nil
+end
+
+EMAIL_PROMPT_MESSAGE = "Der Server verlangt eine Bestätigung der E-Mail-Adresse. Bitte im Browser bei Presidential Bank bestätigen und den Login in MoneyMoney wiederholen."
+
+function isEmailPromptRequired(updateResponse)
+  return type(updateResponse) == "string" and updateResponse:find("/app/emailPrompt", 1, true) ~= nil
+end
+
 function activateOlbSession(mfaResponse, postLoginReferer)
   local homeUrl = CONSTANTS.baseUrl .. "/dbank/live/app/home"
 
   collectRftokenFromResponses(mfaResponse)
 
-  performLoginUpdate(postLoginReferer)
+  local updateResponse = performLoginUpdate(postLoginReferer)
+  if isPasswordResetRequired(updateResponse) then
+    return PASSWORD_RESET_MESSAGE
+  end
+  if isEmailPromptRequired(updateResponse) then
+    return EMAIL_PROMPT_MESSAGE
+  end
 
   local homeHtml = performApiRequest("GET", homeUrl, nil, nil, postLoginReferer)
   collectRftokenFromResponses(homeHtml)
@@ -1736,7 +1695,10 @@ function finalizeLogin(mfaResponse)
   local homeReferer = CONSTANTS.baseUrl .. "/dbank/live/app/home"
 
   followPostLoginRedirect(mfaResponse)
-  activateOlbSession(mfaResponse, postLoginReferer)
+  local activationError = activateOlbSession(mfaResponse, postLoginReferer)
+  if activationError then
+    return activationError
+  end
 
   local authtokenContent = performApiRequest(
     "GET",
@@ -1769,42 +1731,6 @@ function finalizeLogin(mfaResponse)
   end
 
   return "Login fehlgeschlagen: Sitzung konnte nach MFA nicht aktiviert werden."
-end
-
-function findTotpId()
-  if not session.mfaMethods then
-    return nil
-  end
-  for _, m in ipairs(session.mfaMethods) do
-    if m.type == "totp" then
-      return m.id
-    end
-  end
-  return nil
-end
-
-function isMfaSuccess(response)
-  local data = parseJson(response)
-  if not data then
-    return false
-  end
-
-  if data.errorCode then
-    return false
-  end
-
-  if data.targetView == "success" or data.targetView == "redirect" then
-    return true
-  end
-
-  if data.result then
-    local result = parseJson(data.result)
-    if result and result.success == "success" then
-      return true
-    end
-  end
-
-  return false
 end
 
 function ListAccounts(knownAccounts)

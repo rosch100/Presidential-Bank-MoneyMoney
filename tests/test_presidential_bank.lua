@@ -470,66 +470,133 @@ do
     "persistSessionState.writesCookieHeader")
 end
 
--- buildMfaSelectUrl / buildMfaSubmitUrl / buildMfaSelectBody / buildMfaSubmitBody / isMfaSelectSuccess
+-- MFA im Browser-Ablauf (nxg-ui/v1/authentication): Methoden, Anforderung, Verifizierung.
 do
-  local methods = {
-    { protocol = "SMS", type = "sms", id = "sms-1" },
-    { protocol = "VOICE", type = "voice", id = "voice-1" },
-    { protocol = "EMAIL", type = "email", id = "email-1" },
-    { protocol = "TOTP", type = "totp", id = "totp-1" }
-  }
-
-  for _, method in ipairs(methods) do
-    local base = "https://www.presidentialpcbanking.com/auth-olb/live/v1/mfa/"
-    assertEq(
-      buildMfaSelectUrl(method),
-      base .. "select?type=" .. method.type,
-      "buildMfaSelectUrl." .. method.type
-    )
-    assertEq(
-      buildMfaSubmitUrl(method),
-      base .. "submit?displayMethod=" .. method.protocol .. "&type=OTP&cookieoptin=true",
-      "buildMfaSubmitUrl." .. method.type
-    )
-    assertEq(
-      buildMfaSubmitUrl(method, false),
-      base .. "submit?displayMethod=" .. method.protocol .. "&type=OTP&cookieoptin=false",
-      "buildMfaSubmitUrl.noCookieoptin." .. method.type
-    )
-  end
-
-  mergeSessionCookie("CSRFToken", "XYZ")
-
-  assertEq(
-    buildMfaSelectBody(methods[3]),
-    '{"destId":"email-1","csrftoken":"XYZ"}',
-    "buildMfaSelectBody.email"
-  )
-  assertEq(
-    buildMfaSubmitBody(methods[3], "891726"),
-    '{"destId":"email-1","csrftoken":"XYZ","otp":"891726"}',
-    "buildMfaSubmitBody.email"
-  )
-
-  function JSON(str)
-    if str == "select-ok" then
-      return { dictionary = function() return { result = "success" } end }
-    end
-    if str == "select-err" then
-      return { dictionary = function() return { errorCode = "24001" } end }
+  local originalJson = JSON
+  local jsonByText = {}
+  JSON = function(value)
+    if jsonByText[value] then
+      return { dictionary = function() return jsonByText[value] end }
     end
     return { dictionary = function() return nil end }
   end
 
-  assertEq(isMfaSelectSuccess("select-ok"), true, "isMfaSelectSuccess.ok")
-  assertEq(isMfaSelectSuccess("select-err"), false, "isMfaSelectSuccess.error")
-  assertEq(isMfaSelectSuccess(nil), false, "isMfaSelectSuccess.nil")
-end
-do
-  assertEq(isMfaSessionError({ errorCode = "10000" }), true, "isMfaSessionError.10000")
-  assertEq(isMfaSessionError({ errorCode = 10000 }), true, "isMfaSessionError.10000num")
-  assertEq(isMfaSessionError({ errorCode = "25108" }), false, "isMfaSessionError.wrongCode")
-  assertEq(isMfaSessionError(nil), false, "isMfaSessionError.nil")
+  -- Die Erweiterung haelt "connection" als modulweite lokale Variable; sie wird
+  -- nur ueber Connection() (Global) neu gesetzt. Daher Connection() ersetzen und
+  -- ueber resetStaleSessionForFreshLogin installieren.
+  local originalConnection = Connection
+  local recorded = {}
+  local queue = {}
+  Connection = function()
+    return {
+      request = function(_, method, url, body, _, headers)
+        table.insert(recorded, { method = method, url = url, body = body, headers = headers })
+        return table.remove(queue, 1)
+      end,
+      getCookies = function()
+        return ""
+      end,
+    }
+  end
+  local function useRecordingConnection(responses)
+    recorded = {}
+    queue = responses
+    LocalStorage = {}
+    _G.resetStaleSessionForFreshLogin(LocalStorage, "mfa-test@example.invalid")
+  end
+
+  local methods = extractMfaMethods({
+    validatedTotpToken = { id = "totp-1" },
+    validatedPhoneNumbers = { { number = "+49 1", SMS_id = "sms-1", voice_id = "voice-1" } },
+    validatedEmail = { id = "email-1", address = "a@example.invalid" },
+  })
+  assertEq(#methods, 4, "mfaMethods.count")
+  assertEq(methods[1].protocol .. ":" .. methods[1].id .. ":" .. methods[1].type, "TOTP:totp-1:totp", "mfaMethods.totp")
+  assertEq(methods[2].protocol .. ":" .. methods[2].id, "SMS:sms-1", "mfaMethods.sms")
+  assertEq(methods[3].protocol .. ":" .. methods[3].id, "VOICE:voice-1", "mfaMethods.voice")
+  assertEq(methods[4].protocol .. ":" .. methods[4].id, "EMAIL:email-1", "mfaMethods.email")
+  assertEq(#extractMfaMethods({}), 0, "mfaMethods.none")
+  local noNumber, noNumberError = extractMfaMethods({ validatedPhoneNumbers = { { SMS_id = "sms-1" } } })
+  assertEq(noNumber, nil, "mfaMethods.phoneNumberMissing.methods")
+  assertEq(noNumberError, "Telefonnummer fehlt in der MFA-Konfiguration.", "mfaMethods.phoneNumberMissing.error")
+  local badPhone, badPhoneError = extractMfaMethods({ validatedPhoneNumbers = { "+49 1" } })
+  assertEq(badPhone, nil, "mfaMethods.phoneNotTable.methods")
+  assertEq(badPhoneError, "Ungültiger Telefoneintrag in der MFA-Konfiguration.", "mfaMethods.phoneNotTable.error")
+  local noAddress, noAddressError = extractMfaMethods({ validatedEmail = { id = "email-1" } })
+  assertEq(noAddress, nil, "mfaMethods.emailAddressMissing.methods")
+  assertEq(noAddressError, "E-Mail-Adresse fehlt in der MFA-Konfiguration.", "mfaMethods.emailAddressMissing.error")
+
+  jsonByText["MFA-GET"] = {
+    validatedTotpToken = { id = "totp-1" },
+    validatedPhoneNumbers = { { number = "+49 1", SMS_id = "sms-1", voice_id = "voice-1" } },
+    validatedEmail = { id = "email-1", address = "a@example.invalid" },
+  }
+  jsonByText["MFA-REQ-OK"] = { status = "VERIFICATION_REQUIRED" }
+  jsonByText["MFA-REQ-BAD"] = { status = "SOMETHING" }
+  useRecordingConnection({ "MFA-REQ-OK" })
+  assertEq(requestMfaVerification(methods[1]), nil, "requestMfa.ok")
+  assertEq(recorded[1].url, "https://www.presidentialpcbanking.com/nxg-olb-bff/live/nxg-ui/v1/authentication/mfa", "requestMfa.url")
+  assertEq(recorded[1].body, '{"protocol":"TOTP","id":"totp-1"}', "requestMfa.body")
+  assertEq(recorded[1].headers["channel"], "web", "requestMfa.channelHeader")
+
+  useRecordingConnection({ "MFA-REQ-BAD" })
+  local requestError = requestMfaVerification(methods[1])
+  assertEq(
+    type(requestError) == "string" and requestError:find("SOMETHING", 1, true) ~= nil,
+    true,
+    "requestMfa.unexpectedStatus.reported")
+
+  jsonByText["MFA-VERIFY-WRONG"] = { status = "WRONG_CODE" }
+  jsonByText["MFA-VERIFY-OK"] = { status = "AUTHENTICATED" }
+
+  useRecordingConnection({ "MFA-GET", "MFA-REQ-OK", "MFA-VERIFY-WRONG", "MFA-VERIFY-OK" })
+  mergeSessionCookie("SESSION_TOKEN", "sess-test")
+  local challenge = getMfaConfig()
+  assertEq(type(challenge) == "table" and challenge.title, "Two-Factor Authentication", "mfaFlow.selectionChallenge")
+  assertEq(recorded[1].url, "https://www.presidentialpcbanking.com/nxg-olb-bff/live/nxg-ui/v1/authentication/mfa", "mfaFlow.getUrl")
+  assertEq(recorded[1].method, "GET", "mfaFlow.getMethod")
+
+  local selectionResult = handleMethodSelection("1")
+  assertEq(type(selectionResult) == "table" and selectionResult.label, "TOTP Code", "mfaFlow.totpCodeChallenge")
+  assertEq(recorded[2].body, '{"protocol":"TOTP","id":"totp-1"}', "mfaFlow.requestBody")
+
+  assertEq(
+    verifyMfaCode("12a")
+      .challenge:find("Invalid code (digits only)", 1, true) ~= nil,
+    true,
+    "mfaFlow.nonDigitsRetry")
+  assertEq(#recorded, 2, "mfaFlow.nonDigitsNoRequest")
+
+  local wrongResult = verifyMfaCode("123456")
+  assertEq(
+    wrongResult.challenge:find("Status WRONG_CODE", 1, true) ~= nil,
+    true,
+    "mfaFlow.wrongStatusRetry")
+  assertEq(
+    recorded[3].body,
+    '{"oneTimePasscode":"123456","privateDevice":true,"protocol":"TOTP","id":"totp-1"}',
+    "mfaFlow.verifyBody")
+
+  local originalFinalize = finalizeLogin
+  local finalizeInput
+  finalizeLogin = function(response)
+    finalizeInput = response
+    return "FINALIZED-MFA"
+  end
+  assertEq(verifyMfaCode("654321"), "FINALIZED-MFA", "mfaFlow.authenticatedFinalizes")
+  assertEq(finalizeInput, "MFA-VERIFY-OK", "mfaFlow.authenticatedFinalizeInput")
+  finalizeLogin = originalFinalize
+
+  -- E-Mail-Abfrage nach MFA: activateOlbSession bricht mit klarer Meldung ab.
+  local originalUpdate = performLoginUpdate
+  performLoginUpdate = function()
+    return '{"targetData":"/app/emailPrompt","targetView":"redirect"}'
+  end
+  assertEq(activateOlbSession("x", "ref"), EMAIL_PROMPT_MESSAGE, "activateOlbSession.emailPrompt")
+  performLoginUpdate = originalUpdate
+
+  JSON = originalJson
+  Connection = originalConnection
 end
 
 -- extractPostLoginUrl / extractRftokenFromText
@@ -737,14 +804,10 @@ do
   assertEq(headers["Cookie"]:match("rftoken=RF%-RESTORED") ~= nil, true, "restorePersistedSessionState.rftoken")
 end
 
--- parseJson / isMfaSuccess with JSON stub
+-- parseJson with JSON stub
 do
   local jsonMap = {
     good = { a = 1 },
-    outerErr = { errorCode = "X" },
-    outerSuccess = { targetView = "success" },
-    outerResult = { result = "INNER" },
-    INNER = { success = "success" }
   }
 
   function JSON(str)
@@ -766,9 +829,6 @@ do
   assertEq(parseJson(nil), nil, "parseJson.nil")
   assertEq(parseJson("bad"), nil, "parseJson.invalid->nil")
 
-  assertEq(isMfaSuccess("outerErr"), false, "isMfaSuccess.errorCode=false")
-  assertEq(isMfaSuccess("outerSuccess"), true, "isMfaSuccess.targetView-success=true")
-  assertEq(isMfaSuccess("outerResult"), true, "isMfaSuccess.result.success=true")
 end
 
 -- Technische Loginfehler dürfen gespeicherte Zugangsdaten nicht invalidieren.
@@ -998,5 +1058,80 @@ assertEq(
     and missingDirectionError:find("Umsatzrichtung", 1, true) ~= nil,
   true,
   "parseTransactions.missingDirectionMessage")
+
+-- Verzweigung nach external-login (Browser-Ablauf aus den HAR-Dateien).
+do
+  local branchJsonValues = {
+    EXT_REDIRECT = { targetView = "redirect", targetData = "/app/postLogin" },
+    EXT_RESTORE = { targetView = "restore_mfa_redirect" },
+    EXT_MFA = { targetView = "redirect_service", targetData = "/nxg-olb/live/mfa" },
+    REDIR_MFA = { targetView = "redirect_service", targetData = "/nxg-olb/live/mfa" },
+  }
+  local originalJson = JSON
+  JSON = function(value)
+    if branchJsonValues[value] then
+      return { dictionary = function() return branchJsonValues[value] end }
+    end
+    return originalJson(value)
+  end
+
+  local originalFinalize = finalizeLogin
+  local originalRedirect = postLoginRedirect
+  local originalMfaConfig = getMfaConfig
+  local finalizeInput
+  local redirectInput = "unset"
+
+  -- Fall 1: "redirect" -> direkt finalisieren, kein login/redirect.
+  finalizeLogin = function(response)
+    finalizeInput = response
+    return "FINALIZED"
+  end
+  postLoginRedirect = function()
+    error("login/redirect darf bei targetView=redirect nicht aufgerufen werden")
+  end
+  presidentialResponses = {"EXT_REDIRECT"}
+  assertEq(handleLoginStep1({"user", "secret"}), "FINALIZED", "branch.redirect.finalizes")
+  assertEq(finalizeInput, "EXT_REDIRECT", "branch.redirect.finalizeInput")
+
+  -- Fall 2: "restore_mfa_redirect" -> login/redirect mit leerem mfaLSO, dann MFA.
+  postLoginRedirect = function(mfaLso)
+    redirectInput = mfaLso
+    return "REDIR_MFA"
+  end
+  getMfaConfig = function()
+    return "MFA_CHALLENGE"
+  end
+  presidentialResponses = {"EXT_RESTORE"}
+  assertEq(handleLoginStep1({"user", "secret"}), "MFA_CHALLENGE", "branch.restore.mfa")
+  assertEq(redirectInput, "", "branch.restore.emptyMfaLso")
+
+  -- Fall 3: "redirect_service" direkt nach external-login -> MFA-Seite.
+  getMfaConfig = function()
+    return "MFA_DIRECT"
+  end
+  presidentialResponses = {"EXT_MFA"}
+  assertEq(handleLoginStep1({"user", "secret"}), "MFA_DIRECT", "branch.redirectService.mfa")
+
+  -- Passwort-Änderung wird erkannt und gemeldet.
+  assertEq(isPasswordResetRequired('{"targetData":"/app/authUpdate/resetPassword","targetView":"redirect"}'), true, "passwordReset.detected")
+  assertEq(isPasswordResetRequired('{"targetData":"/app/home","targetView":"redirect"}'), false, "passwordReset.notDetected")
+
+  local originalActivate = activateOlbSession
+  activateOlbSession = function()
+    return PASSWORD_RESET_MESSAGE
+  end
+  finalizeLogin = originalFinalize
+  assertEq(finalizeLogin("{}"), PASSWORD_RESET_MESSAGE, "finalizeLogin.passwordReset.propagates")
+  activateOlbSession = originalActivate
+
+  -- E-Mail-Abfrage nach MFA (/app/emailPrompt): Login wird mit klarer Meldung beendet.
+  assertEq(isEmailPromptRequired('{"targetData":"/app/emailPrompt","targetView":"redirect"}'), true, "emailPrompt.detected")
+  assertEq(isEmailPromptRequired('{"targetData":"/app/home","targetView":"redirect"}'), false, "emailPrompt.notDetected")
+
+  JSON = originalJson
+  finalizeLogin = originalFinalize
+  postLoginRedirect = originalRedirect
+  getMfaConfig = originalMfaConfig
+end
 
 print("ALL PRESIDENTIAL BANK UNIT TESTS PASSED")
