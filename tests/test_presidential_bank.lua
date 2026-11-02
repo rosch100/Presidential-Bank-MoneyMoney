@@ -253,20 +253,19 @@ do
   assertEq(extractCsrfTokenFromCookies("nope=1"), nil, "extractCsrfTokenFromCookies.none=nil")
 end
 
--- buildApiHeaders / mergeSessionCookie / applyResponseCookies
+-- withCookieHeader / mergeSessionCookie / applyResponseCookies
 do
   mergeSessionCookie("SESSION_TOKEN", "AAA")
   mergeSessionCookie("CSRFToken", "XYZ")
-  local h = buildApiHeaders()
-  assertEq(h["Cookie"], "SESSION_TOKEN=AAA; CSRFToken=XYZ", "buildApiHeaders.Cookie")
-  assertEq(h["X-Requested-With"], "XMLHttpRequest", "buildApiHeaders.X-Requested-With")
+  local h = withCookieHeader({})
+  assertEq(h["Cookie"], "SESSION_TOKEN=AAA; CSRFToken=XYZ", "withCookieHeader.Cookie")
 
   mergeSessionCookie("rftoken", "RF-99")
-  h = buildApiHeaders()
+  h = withCookieHeader({})
   assertEq(extractCookieValue(h["Cookie"], "rftoken"), "RF-99", "mergeSessionCookie.rftoken")
 
   mergeSessionCookie("rftoken", "RF-NEW")
-  h = buildApiHeaders()
+  h = withCookieHeader({})
   assertEq(extractCookieValue(h["Cookie"], "rftoken"), "RF-NEW", "mergeSessionCookie.update")
 
   mergeSessionCookie("MAF_IB_testdevice", "trust-token")
@@ -317,8 +316,16 @@ do
     "clearStaleSessionTokens.clearsLoginComplete")
 
   applyResponseCookies({ { name = "Set-Cookie", value = "rftoken=FROM-HEADER; Path=/" } })
-  h = buildApiHeaders()
+  h = withCookieHeader({})
   assertEq(extractCookieValue(h["Cookie"], "rftoken"), "FROM-HEADER", "applyResponseCookies.setCookieEntry")
+end
+
+-- buildEmptyMultipartRequest: Boundary in Content-Type und Body muessen zusammenpassen.
+do
+  local body, contentType = buildEmptyMultipartRequest()
+  local boundary = contentType:match("boundary=(.+)$")
+  assertEq(boundary, "----geckoformboundary7b1f0c2d9e4a4f6b8c3d2e1f0a9b8c7d", "emptyMultipart.boundaryInContentType")
+  assertEq(body, "--" .. boundary .. "--\r\n", "emptyMultipart.body")
 end
 
 -- loginRedirectRequiresMfa: only skip TOTP on clear success; MFA redirect stays MFA
@@ -587,6 +594,19 @@ do
   assertEq(finalizeInput, "MFA-VERIFY-OK", "mfaFlow.authenticatedFinalizeInput")
   finalizeLogin = originalFinalize
 
+  -- Nicht ganzzahlige Auswahl wird abgelehnt, ohne eine Anfrage zu senden.
+  useRecordingConnection({ "MFA-GET" })
+  mergeSessionCookie("SESSION_TOKEN", "sess-test")
+  getMfaConfig()
+  local recordedBeforeFraction = #recorded
+  local fractionResult = handleMethodSelection("1.5")
+  assertEq(
+    type(fractionResult) == "table" and fractionResult.challenge:find("Invalid selection", 1, true) ~= nil,
+    true,
+    "mfaFlow.fractionalSelection.rejected")
+  assertEq(#recorded, recordedBeforeFraction, "mfaFlow.fractionalSelection.noRequest")
+  EndSession()
+
   -- E-Mail-Abfrage nach MFA: activateOlbSession bricht mit klarer Meldung ab.
   local originalUpdate = performLoginUpdate
   performLoginUpdate = function()
@@ -798,7 +818,7 @@ do
     presidentialCsrfToken = "REST-CSRF",
     presidentialSessionAccountKey = "user1"
   }, "user1")
-  local headers = buildApiHeaders()
+  local headers = withCookieHeader({})
   assertEq(extractCsrfTokenFromCookies(headers["Cookie"]), "REST-CSRF", "restorePersistedSessionState.csrfToken")
   assertEq(headers["Cookie"]:match("SESSION_TOKEN=RESTORED") ~= nil, true, "restorePersistedSessionState.cookies")
   assertEq(headers["Cookie"]:match("rftoken=RF%-RESTORED") ~= nil, true, "restorePersistedSessionState.rftoken")
@@ -834,6 +854,16 @@ end
 -- Technische Loginfehler dürfen gespeicherte Zugangsdaten nicht invalidieren.
 do
   local authFailures = {}
+  local savedGlobals = {
+    JSON = JSON,
+    followPostLoginRedirect = followPostLoginRedirect,
+    activateOlbSession = activateOlbSession,
+    performApiRequest = performApiRequest,
+    collectRftokenFromResponses = collectRftokenFromResponses,
+    updateDevicePrivateFromAuthtoken = updateDevicePrivateFromAuthtoken,
+    verifySessionWithAccounts = verifySessionWithAccounts,
+    verifySessionWithHistory = verifySessionWithHistory,
+  }
   local function checkTransient(value, label)
     if type(value) == "string" and value ~= "" and value ~= LoginFailed then
       print("OK    " .. label)
@@ -856,6 +886,12 @@ do
           return {
             targetView = "error",
             errorMessage = "Invalid user ID or password",
+          }
+        end
+        if value == "CONSUMER_LOGIN_REJECTED" then
+          return {
+            targetView = "consumer_login",
+            targetData = { initialState = { invalidLogin = true, invalidLoginMessage = "Invalid" } },
           }
         end
         if value == "{}" then
@@ -889,6 +925,9 @@ do
   local rejectedCredentials = handleLoginStep1({"user", "wrong"})
   assertEq(rejectedCredentials, LoginFailed, "handleLoginStep1.rejectedCredentials")
 
+  presidentialResponses = {"CONSUMER_LOGIN_REJECTED"}
+  assertEq(handleLoginStep1({"user", "wrong"}), LoginFailed, "handleLoginStep1.consumerLoginRejected")
+
   presidentialResponses = {"{}"}
   local noRedirectResponse = handleLoginStep1({"user", "secret"})
   checkTransient(noRedirectResponse, "handleLoginStep1.noRedirectResponse.transient")
@@ -918,6 +957,10 @@ do
   verifySessionWithHistory = function() return false end
   local incompleteSession = finalizeLogin("{}")
   checkTransient(incompleteSession, "finalizeLogin.incompleteSession.transient")
+
+  for name, original in pairs(savedGlobals) do
+    _G[name] = original
+  end
 
   if #authFailures > 0 then
     error("Auth error classification failed: " .. table.concat(authFailures, ", "))

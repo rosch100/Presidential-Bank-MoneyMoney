@@ -21,6 +21,8 @@ local CONSTANTS = {
   allowedHost = "www.presidentialpcbanking.com",
 }
 
+local EMPTY_MULTIPART_BOUNDARY = "----geckoformboundary7b1f0c2d9e4a4f6b8c3d2e1f0a9b8c7d"
+
 local CREDENTIAL_REJECTION_MARKERS = {
   "incorrect password",
   "invalid user id or password",
@@ -90,9 +92,6 @@ function InitializeSession2(protocol, bankCode, step, credentials, interactive)
   if session.waitingForMfaCode then
     return verifyMfaCode(credentials[1])
   end
-  if session.waitingForCookieImport then
-    return handleCookieImportStep(credentials)
-  end
 
   return "Anmeldesitzung abgelaufen. Bitte erneut anmelden."
 end
@@ -110,7 +109,20 @@ local function isCredentialRejectionMessage(message)
   return false
 end
 
+-- Der Server meldet abgelehnte Zugangsdaten als targetView "consumer_login"
+-- mit targetData.initialState.invalidLogin = true (ohne errorMessage).
+local function isInvalidLoginView(loginData)
+  local targetData = loginData.targetData
+  return loginData.targetView == "consumer_login"
+    and type(targetData) == "table"
+    and type(targetData.initialState) == "table"
+    and targetData.initialState.invalidLogin == true
+end
+
 local function classifyExternalLoginError(loginData)
+  if isInvalidLoginView(loginData) then
+    return LoginFailed
+  end
   if loginData.targetView ~= "error" and not loginData.errorMessage then
     return nil
   end
@@ -468,12 +480,22 @@ function handleLoginStep1(credentials)
   return getMfaConfig()
 end
 
+-- Ohne Seed liefert math.random in Lua 5.1 nach jedem Start dieselbe Folge.
+math.randomseed(os.time())
+
 function generateUuid()
   local template = "xxxxxxxx-xxxx-4xxx-yxxx-xxxxxxxxxxxx"
   return (template:gsub("[xy]", function(c)
     local v = (c == "x") and math.random(0, 15) or math.random(8, 11)
     return string.format("%x", v)
   end))
+end
+
+-- Leerer Multipart-Body mit passender Boundary, wie der Browser ihn sendet (HAR: Status 200).
+-- Gibt Body und Content-Type zurück.
+function buildEmptyMultipartRequest()
+  return "--" .. EMPTY_MULTIPART_BOUNDARY .. "--\r\n",
+    "multipart/form-data; boundary=" .. EMPTY_MULTIPART_BOUNDARY
 end
 
 function buildMfaBffUrl(path)
@@ -603,7 +625,8 @@ function handleMethodSelection(userInput)
   end
 
   local methodIndex = tonumber(userInput)
-  if not methodIndex or methodIndex < 1 or methodIndex > #session.mfaMethods then
+  if not methodIndex or methodIndex ~= math.floor(methodIndex)
+      or methodIndex < 1 or methodIndex > #session.mfaMethods then
     -- Selection-State erhalten, User soll erneut waehlen.
     return buildMfaSelectionChallenge(
       "Invalid selection. Please enter a number between 1 and " .. #session.mfaMethods .. "."
@@ -1645,13 +1668,18 @@ function activateOlbSession(mfaResponse, postLoginReferer)
   local homeHtml = performApiRequest("GET", homeUrl, nil, nil, postLoginReferer)
   collectRftokenFromResponses(homeHtml)
 
-  performApiRequest(
+  -- Nicht login-kritisch: Fehler werden gemeldet, der Login läuft weiter.
+  local body, contentType = buildEmptyMultipartRequest()
+  local homeConfigResponse = performApiRequest(
     "POST",
     CONSTANTS.baseUrl .. "/site-olb/live/v1/home/config",
-    "",
-    "multipart/form-data",
+    body,
+    contentType,
     homeUrl
   )
+  if not homeConfigResponse or homeConfigResponse:find('"errorCode"', 1, true) then
+    MM.printStatus("Presidential Bank: home/config fehlgeschlagen (Login läuft weiter).")
+  end
   performApiRequest(
     "GET",
     CONSTANTS.acctsApi .. "/home/config?previewExperienceId",
@@ -1714,7 +1742,8 @@ function finalizeLogin(mfaResponse)
     session.deviceRegisteredPrivate = true
   end
 
-  if verifySessionWithAccounts() or verifySessionWithHistory() then
+  -- History zuerst: entspricht dem Browser; accounts-Endpunkte liefern hier 403.
+  if verifySessionWithHistory() or verifySessionWithAccounts() then
     session.loginComplete = true
     persistSessionState(rawget(_G, "LocalStorage"))
     return nil
@@ -2092,72 +2121,11 @@ function loginWithImportedCookies(cookieString)
   return "Cookie import failed (403 Forbidden). The bank rejected the cookies. This is likely due to: (1) IP address binding - cookies only work from same IP as browser, (2) Cloudflare security checks, or (3) Session already expired."
 end
 
-function handleCookieImportStep(credentials)
-  local cookieString = credentials[1]
-
-  if not cookieString or cookieString == "" then
-    session.waitingForCookieImport = nil
-    return "Cookie import cancelled. Please try again with valid cookies from your browser."
-  end
-
-  cookieString = cookieString:gsub("^COOKIE:", "")
-
-  local formattedCookies = cookieString:gsub("^%s*(.-)%s*$", "%1")
-
-  if not formattedCookies:match("rftoken=") then
-    return {
-      title = "Cookie Import Required",
-      challenge = "Cookie string must include rftoken. Please copy the COMPLETE Cookie header from your browser (including SESSION_TOKEN and rftoken).",
-      label = "Cookie string"
-    }
-  end
-
-  session.rftoken = formattedCookies:match("rftoken=([^;]+)")
-  session.cookies = formattedCookies
-  session.cookieImportMode = true
-  session.waitingForCookieImport = nil
-
-  local testUrl = CONSTANTS.acctsApi .. "/history?allowAccountsCall=true&getExportAccountNums=true&getxuseraccts&locationId&pageId=history&transfers_display_xuser_accounts"
-  if session.rftoken then
-    testUrl = testUrl .. "&rftoken=" .. MM.urlencode(session.rftoken)
-  end
-  local testResponse = connection:request("GET", testUrl, nil, nil, buildRequestHeaders())
-
-  if testResponse and (testResponse:match("accountsresponse") or testResponse:match("otherAccounts")) then
-    return nil
-  end
-
-  local body = testResponse and testResponse:lower() or ""
-  if body:find("forbidden") or body:find("unauthorized") or body:find("\"status\"%s*:%s*40") then
-    return "Cookie import failed: Invalid or expired session. Please login to Presidential Bank in your browser again, copy fresh cookies from DevTools → Network (including SESSION_TOKEN and rftoken), and retry."
-  end
-  if body:find("internal server error") or body:find("\"status\"%s*:%s*500") then
-    session.waitingForCookieImport = true
-    return {
-      title = "Cookie Import - Server Error",
-      challenge = "The server returned an internal error. This may be temporary.\n\nPlease try again with the same cookies, or get fresh cookies from your browser:",
-      label = "Cookie string"
-    }
-  end
-
-  return "Cookie import failed. The session may be expired or the cookies are incomplete. Please login to Presidential Bank in your browser, copy fresh cookies from DevTools → Network (including SESSION_TOKEN and rftoken), and retry."
-end
-
 function hasValidSession()
   if session.loginComplete then
     return true
   end
   return session.cookies and session.cookies ~= "" and session.cookies:match("SESSION_TOKEN")
-end
-
-function buildApiHeaders(referer)
-  return withCookieHeader({
-    ["Accept"] = "application/json, text/plain, */*",
-    ["Content-Type"] = "application/json",
-    ["Origin"] = CONSTANTS.baseUrl,
-    ["Referer"] = referer or (CONSTANTS.baseUrl .. "/dbank/live/app/mfa"),
-    ["X-Requested-With"] = "XMLHttpRequest"
-  })
 end
 
 function buildRequestHeaders()
