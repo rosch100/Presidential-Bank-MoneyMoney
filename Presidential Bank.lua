@@ -7,7 +7,7 @@
 --
 
 WebBanking{
-  version     = 1.09,
+  version     = 1.10,
   url         = "https://www.presidentialpcbanking.com",
   services    = {"Presidential Bank"},
   description = "Presidential Bank - MFA and Cookie Import"
@@ -2252,4 +2252,3 @@ function stripNonSerializableConnections(storage)
   end
 end
 
--- SIGNATURE: MCwCFCOtOtzvSpyyqAG8X2dC3oBSpkAWAhQGQibTeyv7xvZxwI5MgEhjfxJUUw==

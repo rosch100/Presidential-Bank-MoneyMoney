@@ -2,7 +2,7 @@
 
 Konten und Umsätze der Presidential Bank in MoneyMoney.
 
-Version: **1.09**
+Version: **1.10**
 Repository: https://github.com/rosch100/Presidential-Bank-MoneyMoney
 Gemeinsame Infos: https://github.com/rosch100/moneymoney-extensions
 
